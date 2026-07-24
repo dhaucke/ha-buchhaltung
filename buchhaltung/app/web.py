@@ -2359,7 +2359,7 @@ def settings_page(settings: dict[str, str]) -> str:
       </div>
       <div class="form-actions"><button class="button primary">Einstellungen speichern</button></div>
     </form>
-    <div class="card">
+    <div class="card form">
       <h3>Datensicherung</h3>
       <p class="muted">Enthält die Datenbank (Kunden, Dokumente, Eingangsrechnungen,
       Einstellungen), das Logo sowie alle erzeugten und importierten PDF-Belege.
@@ -2630,16 +2630,17 @@ Test-ServicePrincipalAuthorization -Identity "{object_id or '<DIENSTPRINZIPAL-OB
         </form>
       </details>
     </div>
-    <div class="card">
+    <div class="card form">
       <p class="notice"><b>Wichtig:</b> Wenn „Application Mail.Send“ zusätzlich als
       organisationsweite Graph-Anwendungsberechtigung mit Admin-Zustimmung in Entra vergeben
       wird, wirkt diese additiv und hebt den engen Exchange-RBAC-Bereich praktisch auf.</p>
       <div class="form-actions">
-      {'<form method="post" action="/settings/microsoft/test"><button class="button primary">Zertifikatsanmeldung testen</button></form>' if graph_status else ''}</div>
-      {f'''<form class="form-actions" method="post" action="/settings/microsoft/send-test-email">
+      {f'''<form class="payment-action wide" method="post" action="/settings/microsoft/send-test-email">
       <input type="email" required name="test_recipient" value="{h(sender)}" placeholder="empfaenger@beispiel.de">
-      <button class="button primary">Testmail senden</button>
+      <button class="button">Testmail senden</button>
       </form>''' if graph_status else ''}
+      {'<form method="post" action="/settings/microsoft/test"><button class="button primary">Zertifikatsanmeldung testen</button></form>' if graph_status else ''}
+      </div>
     </div>"""
 
 

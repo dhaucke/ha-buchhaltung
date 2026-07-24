@@ -60,6 +60,7 @@ main { margin-left: 245px; min-height: 100vh; }
 .inline-actions form { margin: 0; }
 .payment-action { display: flex; gap: 7px; }
 .payment-action input { width: 155px; }
+.payment-action.wide input { width: 260px; }
 .button {
   display: inline-flex; align-items: center; justify-content: center; min-height: 40px;
   border: 1px solid #b8c7da; border-radius: 8px; padding: 9px 15px;

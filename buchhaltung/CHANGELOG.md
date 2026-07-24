@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.7.4
+
+- zwei aus 0.7.3 stammende Karten (Datensicherung, Testmail-Bereich auf
+  der Microsoft-Seite) hatten kein Innenabstand, wodurch Text und Buttons
+  am Kartenrand klebten (`.card` allein bringt kein Padding mit, das kam
+  bislang immer über die zusätzliche Klasse `form`) – behoben
+- Testmail-Eingabefeld war ungebremst 100% breit statt wie das
+  Zertifikat-Testen daneben ausgerichtet zu sein
+
 ## 0.7.3
 
 - Karenzzeit vor der ersten und Mindestabstand zwischen
