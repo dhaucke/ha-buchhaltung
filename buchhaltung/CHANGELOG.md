@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.6.8
+
+- E-Mail-Text beim Versenden von Rechnungen/Gutschriften ist jetzt in den
+  Einstellungen frei anpassbar (Platzhalter: {typ}, {nummer}, {kunde},
+  {firma}, {absender})
+- Dokumenttyp im Standardtext wird korrekt großgeschrieben
+  ("Rechnung 2026-07-0135" statt "rechnung 2026-07-0135")
+
 ## 0.6.7
 
 - ZUGFeRD-Erzeugung für Rechnungen mit Leistungszeitraum (z. B.

@@ -25,7 +25,7 @@ from wsgiref.simple_server import WSGIServer, WSGIRequestHandler, make_server
 from socketserver import ThreadingMixIn
 from PIL import Image as PillowImage, UnidentifiedImageError
 
-from db import Database, suggested_payment_date
+from db import DEFAULT_SETTINGS, Database, suggested_payment_date
 from einvoice import create_zugferd
 from graph import GraphClient
 from euer import EXPENSE_CATEGORIES, create_euer_csv, create_euer_pdf, euer_entries, euer_summary
@@ -526,7 +526,7 @@ def rows(connection, query: str, params=()):
 def fetch_document(connection, document_id: int):
     row = connection.execute(
         """
-        SELECT d.*, c.company, c.customer_number, c.email AS customer_email,
+        SELECT d.*, c.company, c.contact_name, c.customer_number, c.email AS customer_email,
                source.document_number AS source_document_number
         FROM documents d
         JOIN customers c ON c.id=d.customer_id
@@ -1390,10 +1390,20 @@ def send_document_email(connection, document_id: int):
         f"{TYPE_LABELS[document['document_type']]} "
         f"{document['document_number']} von {company_name}"
     )
-    body_html = (
-        f"<p>Guten Tag,</p><p>anbei erhalten Sie {TYPE_LABELS[document['document_type']].lower()} "
-        f"{h(document['document_number'])}.</p><p>Mit freundlichen Grüßen<br>{h(closing_name)}</p>"
-    )
+    template = settings.get("document_email_body") or DEFAULT_SETTINGS["document_email_body"]
+    try:
+        message = template.format(
+            typ=TYPE_LABELS[document["document_type"]],
+            nummer=document["document_number"],
+            kunde=document["contact_name"] or document["company"],
+            firma=company_name,
+            absender=closing_name,
+        )
+    except (KeyError, IndexError) as exc:
+        raise ValueError(
+            f"Der E-Mail-Text in den Einstellungen enthält einen unbekannten Platzhalter: {exc}"
+        ) from exc
+    body_html = "<p>" + h(message).replace("\n\n", "</p><p>").replace("\n", "<br>") + "</p>"
     status = GraphClient(settings).send_pdf(
         document["customer_email"], subject, body_html, pdf.name, pdf.read_bytes()
     )
@@ -2136,6 +2146,10 @@ def settings_page(settings: dict[str, str]) -> str:
       <span>Kleinunternehmerregelung nach § 19 UStG verwenden</span></label>
       <label class="wide"><span>Kleinunternehmer-Hinweis</span>
       <input name="small_business_notice" value="{h(settings.get('small_business_notice'))}"></label>
+      <label class="wide"><span>E-Mail-Text beim Rechnungs-/Gutschriftversand</span>
+      <textarea name="document_email_body" rows="6">{h(settings.get('document_email_body', ''))}</textarea>
+      <small class="muted">Platzhalter: {{typ}}, {{nummer}}, {{kunde}}, {{firma}}, {{absender}}.
+      Leerzeile = neuer Absatz.</small></label>
       </div>
       <div class="form-actions"><button class="button primary">Einstellungen speichern</button></div>
     </form>
