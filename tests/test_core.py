@@ -15,7 +15,7 @@ import pdfplumber
 APP_DIR = Path(__file__).resolve().parents[1] / "buchhaltung" / "app"
 sys.path.insert(0, str(APP_DIR))
 
-from db import Database
+from db import Database, suggested_payment_date
 from einvoice import create_zugferd
 from euer import create_euer_csv, create_euer_pdf, euer_entries, euer_summary
 from pdfgen import create_document_pdf
@@ -37,6 +37,17 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(settings["company_name"], "")
         self.assertEqual(settings["invoice_counter"], "0")
         self.assertEqual(settings["customer_counter"], "0")
+
+    def test_payment_date_suggestion_uses_terms_and_skips_weekend(self):
+        self.assertEqual(
+            suggested_payment_date("2026-07-04", 14),
+            "2026-07-20",
+        )
+        self.assertEqual(
+            suggested_payment_date("2026-07-06", 14),
+            "2026-07-20",
+        )
+        self.assertEqual(suggested_payment_date("", 14), "")
 
     def test_schema_prevents_duplicate_document_numbers(self):
         now = Database.now()

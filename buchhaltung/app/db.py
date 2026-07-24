@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 
@@ -251,6 +251,21 @@ DEFAULT_SETTINGS = {
     "graph_certificate_path": "/data/graph-certificate.pem",
     "graph_private_key_path": "/data/graph-private-key.pem",
 }
+
+
+def suggested_payment_date(issue_date: str, payment_terms_days: int | str) -> str:
+    """Return an editable due-date-style payment suggestion on a weekday."""
+    try:
+        candidate = date.fromisoformat(str(issue_date).strip()) + timedelta(
+            days=max(0, int(payment_terms_days))
+        )
+    except (TypeError, ValueError):
+        return ""
+    if candidate.weekday() == 5:
+        candidate += timedelta(days=2)
+    elif candidate.weekday() == 6:
+        candidate += timedelta(days=1)
+    return candidate.isoformat()
 
 
 class Database:

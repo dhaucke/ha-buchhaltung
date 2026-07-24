@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.5.4
+
+- Zahlungsdatum bei historischen Ausgangsrechnungen wird automatisch
+  vorgeschlagen
+- Grundlage sind Rechnungsdatum und das in den Einstellungen hinterlegte
+  Zahlungsziel
+- Vorschläge auf Samstag oder Sonntag werden auf den folgenden Montag
+  verschoben
+- vorgeschlagenes Datum bleibt für den tatsächlichen Zahlungseingang änderbar
+- „Als bezahlt & nächster Beleg“ verbucht und öffnet mit einem Klick den
+  nächsten offenen Beleg
+
 ## 0.5.3
 
 - fortlaufende Prüfliste für importierte PDF-Belege

@@ -25,7 +25,7 @@ from wsgiref.simple_server import WSGIServer, WSGIRequestHandler, make_server
 from socketserver import ThreadingMixIn
 from PIL import Image as PillowImage, UnidentifiedImageError
 
-from db import Database
+from db import Database, suggested_payment_date
 from einvoice import create_zugferd
 from graph import GraphClient
 from euer import EXPENSE_CATEGORIES, create_euer_csv, create_euer_pdf, euer_entries, euer_summary
@@ -1598,6 +1598,10 @@ def archive_detail(connection, archive_id: int) -> str:
     )
     payment_form = ""
     if not is_incoming:
+        terms = DB.settings().get("payment_terms_days", "14")
+        payment_value = item["payment_date"] or suggested_payment_date(
+            item["detected_issue_date"], terms
+        )
         payment_form = f"""
         <form class="card form" method="post" action="/archive/{archive_id}/payment">
           <h2>Zahlung für EÜR</h2>
@@ -1609,12 +1613,18 @@ def archive_detail(connection, archive_id: int) -> str:
               <option value="paid" {'selected' if item['accounting_status'] == 'paid' else ''}>Bezahlt</option>
               <option value="cancelled" {'selected' if item['accounting_status'] == 'cancelled' else ''}>Storniert</option>
             </select></label>
-            <label><span>Zahlungsdatum</span><input type="date" name="payment_date" value="{h(item['payment_date'])}"></label>
+            <label><span>Zahlungsdatum</span><input type="date" name="payment_date" value="{h(payment_value)}"></label>
           </div>
+          <p class="muted">Vorschlag: Rechnungsdatum plus {h(terms)} Tage Zahlungsziel;
+          Samstag und Sonntag werden auf Montag verschoben. Für die EÜR bitte
+          abweichende tatsächliche Zahlungseingänge korrigieren.</p>
           <div class="form-actions">
             <button class="button">Zahlungsstatus speichern</button>
             <button class="button primary" name="continue" value="1">
               Speichern &amp; nächster Beleg
+            </button>
+            <button class="button primary" name="mark_paid" value="1">
+              Als bezahlt &amp; nächster Beleg
             </button>
           </div>
         </form>"""
@@ -2577,7 +2587,11 @@ def application(environ, start_response):
                 if not item or item["document_direction"] != "outgoing":
                     raise ValueError("Zahlungen können hier nur für Ausgangsrechnungen erfasst werden.")
                 form = parse_form(environ)
-                status = str(form.get("accounting_status", "unbooked"))
+                mark_paid = form.get("mark_paid") == "1"
+                status = (
+                    "paid" if mark_paid
+                    else str(form.get("accounting_status", "unbooked"))
+                )
                 if status not in ("unbooked", "paid", "cancelled"):
                     raise ValueError("Ungültiger Zahlungsstatus.")
                 payment_date = str(form.get("payment_date", "")).strip() or None
@@ -2597,7 +2611,7 @@ def application(environ, start_response):
                     ),
                 )
                 Database.audit(connection, "archive", archive_id, f"accounting_{status}")
-                if form.get("continue") == "1":
+                if form.get("continue") == "1" or mark_paid:
                     connection.execute(
                         "UPDATE archive_files SET reviewed_at=? WHERE id=?",
                         (now, archive_id),
