@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.5.7
+
+- Ausgangsrechnungen werden beim Markieren als bezahlt automatisch einem
+  Kunden zugeordnet, sofern die Erkennung erfolgreich war
+- kein separater Klick auf „Kundendaten übernehmen“ mehr für den
+  Regelfall nötig
+- Eingangsrechnungen übernehmen erkannten Lieferantennamen und -anschrift
+  direkt aus dem PDF-Import als Vorschlag
+- Auswahlliste bekannter Lieferanten füllt Anschrift, Ansprechpartner und
+  E-Mail automatisch aus, sobald der Firmenname übereinstimmt
+
 ## 0.5.6
 
 - Archiv kann nach Kunden- bzw. Unternehmensname gefiltert werden

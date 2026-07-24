@@ -1756,6 +1756,80 @@ def update_archive_analysis(connection, archive_id: int, result: dict):
     Database.link_archives_by_customer_number(connection, archive_id)
 
 
+def link_or_create_customer(connection, archive_id: int) -> tuple[int, str]:
+    """Match the recognized sender to an existing customer or create one.
+
+    Shared by the manual "Kundendaten übernehmen" action and by automatic
+    linking when a document is marked as paid.
+    """
+    item = connection.execute(
+        "SELECT * FROM archive_files WHERE id=?", (archive_id,)
+    ).fetchone()
+    if not item or not item["detected_customer_name"]:
+        raise ValueError("Bitte zuerst mindestens den Kundennamen prüfen und speichern.")
+    existing_customer = connection.execute(
+        """
+        SELECT id, customer_number FROM customers
+        WHERE (
+            ? != '' AND customer_number=?
+        ) OR (
+            lower(trim(company))=lower(trim(?))
+            AND (?='' OR postal_code=?)
+        )
+        ORDER BY id LIMIT 1
+        """,
+        (
+            item["detected_customer_number"], item["detected_customer_number"],
+            item["detected_customer_name"], item["detected_postal_code"],
+            item["detected_postal_code"],
+        ),
+    ).fetchone()
+    if existing_customer:
+        customer_id = existing_customer["id"]
+        customer_number = existing_customer["customer_number"]
+        message = f"Vorhandener Kunde {customer_number} wurde mit dem PDF verknüpft."
+    else:
+        settings = DB.settings()
+        detected_number = item["detected_customer_number"].strip()
+        number_in_use = (
+            connection.execute(
+                "SELECT 1 FROM customers WHERE customer_number=?",
+                (detected_number,),
+            ).fetchone()
+            if detected_number else None
+        )
+        customer_number = (
+            detected_number
+            if detected_number and not number_in_use
+            else str(int(settings["customer_counter"]) + 1)
+        )
+        now = Database.now()
+        customer_id = connection.execute(
+            """
+            INSERT INTO customers(customer_number, company, street, postal_code, city, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                customer_number, item["detected_customer_name"],
+                item["detected_street"], item["detected_postal_code"],
+                item["detected_city"], now, now,
+            ),
+        ).lastrowid
+        connection.execute(
+            "UPDATE settings SET value=? WHERE key='customer_counter'",
+            (str(max(int(settings["customer_counter"]), int(customer_number)))
+             if customer_number.isdigit() else settings["customer_counter"],),
+        )
+        Database.audit(connection, "customer", customer_id, "created_from_archive", str(archive_id))
+        message = f"Kunde {customer_number} wurde aus dem PDF angelegt."
+    connection.execute(
+        "UPDATE archive_files SET customer_id=? WHERE id=?",
+        (customer_id, archive_id),
+    )
+    Database.audit(connection, "archive", archive_id, "customer_linked", str(customer_id))
+    return customer_id, message
+
+
 def incoming_page(connection) -> str:
     invoices = rows(
         connection,
@@ -1794,9 +1868,12 @@ def incoming_page(connection) -> str:
 def incoming_detail(connection, incoming_id: int) -> str:
     item = connection.execute(
         """
-        SELECT i.*, a.original_filename, a.id archive_id, COALESCE(s.company,'') supplier_company,
-               COALESCE(s.contact_name,'') supplier_contact, COALESCE(s.street,'') supplier_street,
-               COALESCE(s.postal_code,'') supplier_postal_code, COALESCE(s.city,'') supplier_city,
+        SELECT i.*, a.original_filename, a.id archive_id,
+               COALESCE(NULLIF(s.company,''), a.detected_customer_name) supplier_company,
+               COALESCE(s.contact_name,'') supplier_contact,
+               COALESCE(NULLIF(s.street,''), a.detected_street) supplier_street,
+               COALESCE(NULLIF(s.postal_code,''), a.detected_postal_code) supplier_postal_code,
+               COALESCE(NULLIF(s.city,''), a.detected_city) supplier_city,
                COALESCE(s.email,'') supplier_email
         FROM incoming_invoices i
         LEFT JOIN archive_files a ON a.id=i.archive_file_id
@@ -1807,6 +1884,24 @@ def incoming_detail(connection, incoming_id: int) -> str:
     ).fetchone()
     if not item:
         raise ValueError("Eingangsrechnung wurde nicht gefunden.")
+    suppliers = rows(
+        connection,
+        """
+        SELECT company, contact_name, street, postal_code, city, email
+        FROM suppliers ORDER BY company COLLATE NOCASE
+        """,
+    )
+    supplier_options = "".join(
+        f'<option value="{h(supplier["company"])}"></option>' for supplier in suppliers
+    )
+    supplier_map = json.dumps({
+        supplier["company"].strip().lower(): {
+            "contact": supplier["contact_name"], "street": supplier["street"],
+            "postal_code": supplier["postal_code"], "city": supplier["city"],
+            "email": supplier["email"],
+        }
+        for supplier in suppliers
+    })
     category_options = "".join(
         f'<option value="{h(category)}" {"selected" if category == item["eur_category"] else ""}>{h(category)}</option>'
         for category in EXPENSE_CATEGORIES
@@ -1833,13 +1928,17 @@ def incoming_detail(connection, incoming_id: int) -> str:
     </div>
     <form class="card form" method="post" action="/incoming/{incoming_id}">
       <h2>Lieferant</h2>
+      <p class="muted">Bei Auswahl eines bereits bekannten Lieferanten werden Anschrift und
+      E-Mail automatisch übernommen.</p>
       <div class="form-grid">
-        <label><span>Unternehmen *</span><input {readonly} required name="supplier_company" value="{h(item['supplier_company'])}"></label>
-        <label><span>Ansprechpartner</span><input {readonly} name="supplier_contact" value="{h(item['supplier_contact'])}"></label>
-        <label class="wide"><span>Straße</span><input {readonly} name="supplier_street" value="{h(item['supplier_street'])}"></label>
-        <label><span>PLZ</span><input {readonly} name="supplier_postal_code" value="{h(item['supplier_postal_code'])}"></label>
-        <label><span>Ort</span><input {readonly} name="supplier_city" value="{h(item['supplier_city'])}"></label>
-        <label><span>E-Mail</span><input {readonly} type="email" name="supplier_email" value="{h(item['supplier_email'])}"></label>
+        <label><span>Unternehmen *</span><input {readonly} required list="supplier-options"
+          id="supplier-company" name="supplier_company" value="{h(item['supplier_company'])}"></label>
+        <datalist id="supplier-options">{supplier_options}</datalist>
+        <label><span>Ansprechpartner</span><input {readonly} id="supplier-contact" name="supplier_contact" value="{h(item['supplier_contact'])}"></label>
+        <label class="wide"><span>Straße</span><input {readonly} id="supplier-street" name="supplier_street" value="{h(item['supplier_street'])}"></label>
+        <label><span>PLZ</span><input {readonly} id="supplier-postal-code" name="supplier_postal_code" value="{h(item['supplier_postal_code'])}"></label>
+        <label><span>Ort</span><input {readonly} id="supplier-city" name="supplier_city" value="{h(item['supplier_city'])}"></label>
+        <label><span>E-Mail</span><input {readonly} type="email" id="supplier-email" name="supplier_email" value="{h(item['supplier_email'])}"></label>
       </div>
       <h3>Buchungsdaten</h3>
       <div class="form-grid">
@@ -1857,7 +1956,29 @@ def incoming_detail(connection, incoming_id: int) -> str:
       verwendet. Sonderfälle – insbesondere AfA, Bewirtung und private Anteile – müssen
       steuerlich geprüft werden.</p>
       {'<div class="form-actions"><button name="action" value="booked" class="button">Als gebucht speichern</button><button name="action" value="paid" class="button primary">Speichern und als bezahlt buchen</button></div>' if editable else ''}
-    </form>"""
+    </form>
+    {f'''<script>
+    (() => {{
+      const suppliers = {supplier_map};
+      const company = document.getElementById("supplier-company");
+      const fields = {{
+        contact: document.getElementById("supplier-contact"),
+        street: document.getElementById("supplier-street"),
+        postal_code: document.getElementById("supplier-postal-code"),
+        city: document.getElementById("supplier-city"),
+        email: document.getElementById("supplier-email"),
+      }};
+      company.addEventListener("input", () => {{
+        const match = suppliers[company.value.trim().toLowerCase()];
+        if (!match) return;
+        fields.contact.value = match.contact;
+        fields.street.value = match.street;
+        fields.postal_code.value = match.postal_code;
+        fields.city.value = match.city;
+        fields.email.value = match.email;
+      }});
+    }})();
+    </script>''' if editable else ''}"""
 
 
 def euer_page(connection, year: int) -> str:
@@ -2672,7 +2793,10 @@ def application(environ, start_response):
                 filters = archive_filters_from_query(query)
                 filter_suffix = archive_filter_suffix(filters)
                 item = connection.execute(
-                    "SELECT document_direction, detected_amount_cents FROM archive_files WHERE id=?",
+                    """
+                    SELECT document_direction, detected_amount_cents, customer_id,
+                    detected_customer_name FROM archive_files WHERE id=?
+                    """,
                     (archive_id,),
                 ).fetchone()
                 if not item or item["document_direction"] != "outgoing":
@@ -2690,6 +2814,10 @@ def application(environ, start_response):
                     raise ValueError("Bitte das tatsächliche Zahlungsdatum angeben.")
                 if status == "paid" and item["detected_amount_cents"] is None:
                     raise ValueError("Bitte zuerst den Rechnungsbetrag erfassen.")
+                link_prefix = ""
+                if status == "paid" and not item["customer_id"] and item["detected_customer_name"]:
+                    _, link_message = link_or_create_customer(connection, archive_id)
+                    link_prefix = f"{link_message} "
                 now = Database.now()
                 connection.execute(
                     """
@@ -2721,83 +2849,19 @@ def application(environ, start_response):
                         return redirect(
                             start_response,
                             f"/archive/{next_id}{filter_suffix}",
-                            "Zahlungsstatus wurde gespeichert. "
+                            f"{link_prefix}Zahlungsstatus wurde gespeichert. "
                             "Nächster offener Beleg wurde geladen.",
                         )
                     return redirect(
                         start_response,
                         "/archive",
-                        "Zahlungsstatus wurde gespeichert. "
+                        f"{link_prefix}Zahlungsstatus wurde gespeichert. "
                         "Die Prüfliste ist vollständig abgearbeitet.",
                     )
-                return redirect(start_response, f"/archive/{archive_id}", "Zahlungsstatus wurde gespeichert.")
+                return redirect(start_response, f"/archive/{archive_id}", f"{link_prefix}Zahlungsstatus wurde gespeichert.")
             elif method == "POST" and re.fullmatch(r"/archive/\d+/customer", path):
                 archive_id = int(path.split("/")[2])
-                item = connection.execute(
-                    "SELECT * FROM archive_files WHERE id=?", (archive_id,)
-                ).fetchone()
-                if not item or not item["detected_customer_name"]:
-                    raise ValueError("Bitte zuerst mindestens den Kundennamen prüfen und speichern.")
-                existing_customer = connection.execute(
-                    """
-                    SELECT id, customer_number FROM customers
-                    WHERE (
-                        ? != '' AND customer_number=?
-                    ) OR (
-                        lower(trim(company))=lower(trim(?))
-                        AND (?='' OR postal_code=?)
-                    )
-                    ORDER BY id LIMIT 1
-                    """,
-                    (
-                        item["detected_customer_number"], item["detected_customer_number"],
-                        item["detected_customer_name"], item["detected_postal_code"],
-                        item["detected_postal_code"],
-                    ),
-                ).fetchone()
-                if existing_customer:
-                    customer_id = existing_customer["id"]
-                    customer_number = existing_customer["customer_number"]
-                    message = f"Vorhandener Kunde {customer_number} wurde mit dem PDF verknüpft."
-                else:
-                    settings = DB.settings()
-                    detected_number = item["detected_customer_number"].strip()
-                    number_in_use = (
-                        connection.execute(
-                            "SELECT 1 FROM customers WHERE customer_number=?",
-                            (detected_number,),
-                        ).fetchone()
-                        if detected_number else None
-                    )
-                    customer_number = (
-                        detected_number
-                        if detected_number and not number_in_use
-                        else str(int(settings["customer_counter"]) + 1)
-                    )
-                    now = Database.now()
-                    customer_id = connection.execute(
-                        """
-                        INSERT INTO customers(customer_number, company, street, postal_code, city, created_at, updated_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        (
-                            customer_number, item["detected_customer_name"],
-                            item["detected_street"], item["detected_postal_code"],
-                            item["detected_city"], now, now,
-                        ),
-                    ).lastrowid
-                    connection.execute(
-                        "UPDATE settings SET value=? WHERE key='customer_counter'",
-                        (str(max(int(settings["customer_counter"]), int(customer_number)))
-                         if customer_number.isdigit() else settings["customer_counter"],),
-                    )
-                    Database.audit(connection, "customer", customer_id, "created_from_archive", str(archive_id))
-                    message = f"Kunde {customer_number} wurde aus dem PDF angelegt."
-                connection.execute(
-                    "UPDATE archive_files SET customer_id=? WHERE id=?",
-                    (customer_id, archive_id),
-                )
-                Database.audit(connection, "archive", archive_id, "customer_linked", str(customer_id))
+                _, message = link_or_create_customer(connection, archive_id)
                 return redirect(start_response, f"/archive/{archive_id}", message)
             elif method == "POST" and re.fullmatch(r"/archive/\d+/delete", path):
                 archive_id = int(path.split("/")[2])
