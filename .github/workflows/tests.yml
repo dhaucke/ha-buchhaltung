@@ -1,0 +1,18 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Abhängigkeiten installieren
+        run: pip install cryptography==45.0.7 pillow==11.3.0 pdfplumber==0.11.7 reportlab==4.4.3
+      - name: Anwendung testen
+        run: python -m unittest discover -s tests -v
