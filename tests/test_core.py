@@ -594,6 +594,138 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(result["customer_name"], "Test GmbH")
         self.assertEqual(result["customer_number"], "1003")
 
+    def test_pdf_generation_with_mixed_tax_rates(self):
+        settings = self.db.settings()
+        settings.update({
+            "company_name": "Musterbetrieb",
+            "owner_name": "Max Mustermann",
+            "street": "Beispielstraße 1",
+            "postal_code": "10117",
+            "city": "Berlin",
+            "email": "rechnung@example.invalid",
+            "small_business_enabled": "0",
+        })
+        items = [{
+            "position": 1, "category": "Hosting", "description": "Webserver",
+            "quantity_milli": 1000, "unit": "pauschal", "unit_price_cents": 6000,
+            "total_cents": 6000, "tax_rate_bp": 1900, "service_period": "Juli 2026",
+        }, {
+            "position": 2, "category": "Literatur", "description": "Fachbuch",
+            "quantity_milli": 1000, "unit": "Stück", "unit_price_cents": 5000,
+            "total_cents": 5000, "tax_rate_bp": 700, "service_period": "",
+        }]
+        net_total = sum(item["total_cents"] for item in items)
+        tax_total = 1140 + 350
+        output = Path(self.temp.name) / "mixed-tax.pdf"
+        create_document_pdf(
+            output,
+            {
+                "document_type": "invoice", "document_number": "2026-07-0133",
+                "issue_date": "2026-07-23", "due_date": "2026-08-06",
+                "title": "Gemischte Steuersätze", "introduction": "", "notes": "",
+                "total_cents": net_total + tax_total, "tax_cents": tax_total,
+            },
+            {
+                "customer_number": "1002", "company": "Muster GmbH", "contact_name": "",
+                "street": "Musterweg 1", "postal_code": "12345", "city": "Berlin",
+            },
+            items, settings, None,
+        )
+        with pdfplumber.open(output) as pdf:
+            text = "\n".join(page.extract_text() or "" for page in pdf.pages)
+        self.assertIn("Nettobetrag", text)
+        self.assertIn("110,00 €", text)
+        self.assertIn("zzgl. 19% USt", text)
+        self.assertIn("11,40 €", text)
+        self.assertIn("zzgl. 7% USt", text)
+        self.assertIn("3,50 €", text)
+        self.assertIn("Rechnungsbetrag", text)
+        self.assertIn("124,90 €", text)
+
+    def test_kleinunternehmer_pdf_unaffected_by_tax_columns(self):
+        settings = self.db.settings()
+        settings.update({
+            "company_name": "Musterbetrieb",
+            "owner_name": "Max Mustermann",
+            "street": "Beispielstraße 1",
+            "postal_code": "10117",
+            "city": "Berlin",
+            "email": "rechnung@example.invalid",
+        })
+        output = Path(self.temp.name) / "kleinunternehmer.pdf"
+        create_document_pdf(
+            output,
+            {
+                "document_type": "invoice", "document_number": "2026-07-0133",
+                "issue_date": "2026-07-23", "due_date": "2026-07-30",
+                "title": "Hosting", "introduction": "", "notes": "",
+                "total_cents": 6000, "tax_cents": 0,
+            },
+            {
+                "customer_number": "1002", "company": "Muster GmbH", "contact_name": "",
+                "street": "Musterweg 1", "postal_code": "12345", "city": "Berlin",
+            },
+            [{
+                "position": 1, "category": "Hosting", "description": "Virtueller Webserver",
+                "quantity_milli": 1000, "unit": "pauschal", "unit_price_cents": 6000,
+                "total_cents": 6000, "tax_rate_bp": 0, "service_period": "Juli 2026",
+            }],
+            settings, None,
+        )
+        with pdfplumber.open(output) as pdf:
+            text = "\n".join(page.extract_text() or "" for page in pdf.pages)
+        self.assertNotIn("USt-Satz", text)
+        self.assertNotIn("zzgl.", text)
+        self.assertNotIn("Nettobetrag", text)
+        self.assertIn("Rechnungsbetrag", text)
+        self.assertIn("Steuerbefreiung für Kleinunternehmer", text)
+
+    def test_incoming_deductible_split_computes_vorsteuer(self):
+        os.environ.setdefault("HD_DATA_DIR", tempfile.mkdtemp())
+        from web import incoming_deductible_split
+
+        settings = self.db.settings()
+        settings["small_business_enabled"] = "0"
+        deductible, vorsteuer, stored_rate = incoming_deductible_split(
+            11900, 80, 1900, settings
+        )
+        self.assertEqual(stored_rate, 1900)
+        self.assertEqual(deductible, 8000)
+        self.assertEqual(vorsteuer, 1520)
+
+        settings["small_business_enabled"] = "1"
+        deductible, vorsteuer, stored_rate = incoming_deductible_split(
+            11900, 80, 1900, settings
+        )
+        self.assertEqual(stored_rate, 0)
+        self.assertEqual(vorsteuer, 0)
+        self.assertEqual(deductible, 9520)
+
+    def test_euer_reports_vorsteuer_for_regelbesteuerung_incoming_invoice(self):
+        now = Database.now()
+        with self.db.connect() as connection:
+            supplier_id = connection.execute(
+                "INSERT INTO suppliers(company,created_at,updated_at) VALUES ('Hosting AG',?,?)",
+                (now, now),
+            ).lastrowid
+            connection.execute(
+                """
+                INSERT INTO incoming_invoices(
+                    supplier_id, invoice_number, invoice_date, payment_date, status,
+                    eur_category, gross_cents, business_share_percent, deductible_cents,
+                    tax_rate_bp, vorsteuer_cents, created_at, updated_at
+                ) VALUES (?, 'R-2', '2026-01-02', '2026-01-05', 'paid',
+                          'Software und IT', 11900, 100, 10000, 1900, 1900, ?, ?)
+                """,
+                (supplier_id, now, now),
+            )
+            entries = euer_entries(connection, 2026)
+        summary = euer_summary(entries)
+        self.assertEqual(summary["expense_cents"], 10000)
+        self.assertEqual(summary["vorsteuer_cents"], 1900)
+        csv_data = create_euer_csv(entries).decode("utf-8-sig")
+        self.assertIn("Gezahlte Vorsteuer", csv_data)
+
     def test_zugferd_generation_and_embedded_xml_validation(self):
         try:
             from facturx import get_xml_from_pdf, xml_check_xsd
@@ -636,6 +768,73 @@ class CoreTests(unittest.TestCase):
         regular = Path(self.temp.name) / "invoice.pdf"
         output = Path(self.temp.name) / "invoice-zugferd.pdf"
         xml_output = Path(self.temp.name) / "factur-x.xml"
+        create_document_pdf(regular, document, customer, items, settings, None)
+        result = create_zugferd(
+            regular, output, xml_output, document, customer, items, settings
+        )
+        embedded_name, embedded_xml = get_xml_from_pdf(
+            output.read_bytes(), check_xsd=True, check_schematron=False
+        )
+        self.assertEqual(embedded_name, "factur-x.xml")
+        self.assertTrue(
+            xml_check_xsd(embedded_xml, flavor="factur-x", level="en16931")
+        )
+        self.assertTrue(result["xsd_valid"])
+        schematron = validate_schematron(xml_output.read_bytes())
+        if schematron["available"]:
+            self.assertTrue(result["schematron_checked"])
+            self.assertTrue(
+                result["schematron_valid"],
+                f"Mustang-Schematron-Prüfung meldet EN-16931-Regelverstöße:\n{schematron['report']}",
+            )
+        else:
+            self.assertFalse(result["schematron_checked"])
+            self.assertIsNone(result["schematron_valid"])
+
+    def test_zugferd_generation_with_mixed_tax_rates(self):
+        try:
+            from facturx import get_xml_from_pdf, xml_check_xsd
+        except ImportError:
+            self.skipTest("factur-x ist in der lokalen Testumgebung nicht installiert")
+        settings = self.db.settings()
+        settings.update({
+            "company_name": "Musterbetrieb",
+            "owner_name": "Max Mustermann",
+            "street": "Beispielstraße 1",
+            "postal_code": "10117",
+            "city": "Berlin",
+            "country": "Deutschland",
+            "email": "rechnung@example.invalid",
+            "tax_number": "12/345/67890",
+            "vat_id": "DE123456789",
+            "iban": "DE02120300000000202051",
+            "small_business_enabled": "0",
+        })
+        document = {
+            "document_type": "invoice", "document_number": "2026-07-0134",
+            "issue_date": "2026-07-23", "due_date": "2026-08-06",
+            "service_start": None, "service_end": None, "payment_terms_days": 14,
+            "title": "Hosting und Fachliteratur", "introduction": "", "notes": "",
+            "credit_reason": "", "total_cents": 12490, "tax_cents": 1490,
+        }
+        customer = {
+            "customer_number": "1003", "company": "Test GmbH", "contact_name": "",
+            "street": "Testweg 1", "postal_code": "12345", "city": "Berlin",
+            "country": "Deutschland", "email": "kunde@example.invalid",
+            "buyer_reference": "",
+        }
+        items = [{
+            "position": 1, "category": "Hosting", "description": "Webserver",
+            "quantity_milli": 1000, "unit": "pauschal", "unit_price_cents": 6000,
+            "total_cents": 6000, "tax_rate_bp": 1900, "service_period": "Juli 2026",
+        }, {
+            "position": 2, "category": "Literatur", "description": "Fachbuch",
+            "quantity_milli": 1000, "unit": "Stück", "unit_price_cents": 5000,
+            "total_cents": 5000, "tax_rate_bp": 700, "service_period": "",
+        }]
+        regular = Path(self.temp.name) / "invoice-mixed.pdf"
+        output = Path(self.temp.name) / "invoice-mixed-zugferd.pdf"
+        xml_output = Path(self.temp.name) / "factur-x-mixed.xml"
         create_document_pdf(regular, document, customer, items, settings, None)
         result = create_zugferd(
             regular, output, xml_output, document, customer, items, settings

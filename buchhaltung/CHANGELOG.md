@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.8.0
+
+- das Tool war bisher ausschließlich für Kleinunternehmer nach § 19 UStG
+  ausgelegt (keine Umsatzsteuer wurde je berechnet); die bestehende
+  Einstellung „Kleinunternehmerregelung verwenden“ ist jetzt ein
+  echter Umschalter – deaktiviert, wird auf Ausgangsrechnungen pro
+  Position ein USt-Satz (19 %/7 %/0 %) erfasst, Netto-/USt-/Bruttobeträge
+  werden in Formular, PDF und ZUGFeRD-XML korrekt ausgewiesen
+  (gruppiert nach Steuersatz) und eine USt-IdNr. kann hinterlegt werden
+- Eingangsrechnungen erlauben in diesem Modus die Angabe des im Beleg
+  ausgewiesenen USt-Satzes; die Vorsteuer wird automatisch aus
+  Bruttobetrag, Steuersatz und betrieblichem Anteil berechnet und separat
+  ausgewiesen
+- die EÜR-Auswertung (Seite, CSV- und PDF-Export) zeigt die gezahlte
+  Vorsteuer als eigene, informative Zeile – ersetzt keine
+  Umsatzsteuervoranmeldung
+- für Kleinunternehmer ändert sich nichts: ohne Umschalten bleiben
+  Formulare, PDFs und ZUGFeRD-Dateien exakt wie zuvor
+
 ## 0.7.4
 
 - zwei aus 0.7.3 stammende Karten (Datensicherung, Testmail-Bereich auf

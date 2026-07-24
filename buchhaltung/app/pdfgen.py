@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import date
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 
 from reportlab.lib import colors
@@ -242,10 +242,14 @@ def create_document_pdf(
         story.append(Paragraph(document["introduction"], styles["Body"]))
         story.append(Spacer(1, 4 * mm))
 
-    item_rows = [["Pos.", "Leistung / Leistungszeitraum", "Menge", "Einzelpreis", "Gesamt"]]
+    tax_enabled = settings.get("small_business_enabled", "1") != "1"
+    header_row = ["Pos.", "Leistung / Leistungszeitraum", "Menge", "Einzelpreis", "Gesamt"]
+    if tax_enabled:
+        header_row.insert(4, "USt.")
+    item_rows = [header_row]
     for item in items:
         quantity = Decimal(item["quantity_milli"]) / 1000
-        quantity_text = f"{quantity.normalize()}<br/>{h_xml(item['unit'])}"
+        quantity_text = f"{format(quantity.normalize(), 'f')}<br/>{h_xml(item['unit'])}"
         description = item["description"]
         if item.get("category"):
             description = f"<b>{h_xml(item['category'])}</b><br/>{h_xml(description)}"
@@ -256,19 +260,24 @@ def create_document_pdf(
                 f'<br/><font size="7" color="#64748b">'
                 f'Leistungszeitraum: {h_xml(item["service_period"])}</font>'
             )
-        item_rows.append(
-            [
-                str(item["position"]),
-                Paragraph(description, styles["TableCell"]),
-                Paragraph(quantity_text, styles["TableCellCenter"]),
-                money(item["unit_price_cents"]),
-                money(item["total_cents"]),
-            ]
-        )
+        row = [
+            str(item["position"]),
+            Paragraph(description, styles["TableCell"]),
+            Paragraph(quantity_text, styles["TableCellCenter"]),
+            money(item["unit_price_cents"]),
+            money(item["total_cents"]),
+        ]
+        if tax_enabled:
+            row.insert(4, f"{Decimal(item.get('tax_rate_bp', 0)) / 100:g}%")
+        item_rows.append(row)
     item_table = Table(
         item_rows,
         repeatRows=1,
-        colWidths=[9 * mm, 88 * mm, 25 * mm, 28 * mm, 28 * mm],
+        colWidths=(
+            [9 * mm, 79 * mm, 22 * mm, 25 * mm, 15 * mm, 25 * mm]
+            if tax_enabled else
+            [9 * mm, 88 * mm, 25 * mm, 28 * mm, 28 * mm]
+        ),
     )
     item_table.setStyle(
         TableStyle(
@@ -291,16 +300,31 @@ def create_document_pdf(
     )
     story.extend([item_table, Spacer(1, 6 * mm)])
 
+    gross_label = {
+        "invoice": "Rechnungsbetrag",
+        "credit": "Gutschriftsbetrag",
+    }.get(document["document_type"], "Gesamtbetrag")
+    if tax_enabled and document.get("tax_cents", 0) > 0:
+        rate_groups: dict[int, int] = {}
+        for item in items:
+            rate_bp = item.get("tax_rate_bp", 0)
+            item_tax = int(
+                (Decimal(item["total_cents"]) * rate_bp / 10000).quantize(
+                    Decimal("1"), rounding=ROUND_HALF_UP
+                )
+            )
+            if item_tax:
+                rate_groups[rate_bp] = rate_groups.get(rate_bp, 0) + item_tax
+        totals_rows = [["Nettobetrag", money(document["total_cents"] - document["tax_cents"])]]
+        for rate_bp in sorted(rate_groups):
+            totals_rows.append(
+                [f"zzgl. {Decimal(rate_bp) / 100:g}% USt", money(rate_groups[rate_bp])]
+            )
+        totals_rows.append([gross_label, money(document["total_cents"])])
+    else:
+        totals_rows = [[gross_label, money(document["total_cents"])]]
     totals = Table(
-        [
-            [
-                {
-                    "invoice": "Rechnungsbetrag",
-                    "credit": "Gutschriftsbetrag",
-                }.get(document["document_type"], "Gesamtbetrag"),
-                money(document["total_cents"]),
-            ],
-        ],
+        totals_rows,
         colWidths=[45 * mm, 35 * mm],
         hAlign="RIGHT",
     )

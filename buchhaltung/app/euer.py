@@ -107,7 +107,7 @@ def euer_entries(connection, year: int) -> list[dict]:
     for row in connection.execute(
         """
         SELECT i.id, i.invoice_number number, i.payment_date,
-               i.deductible_cents amount_cents, COALESCE(s.company,'') party,
+               i.deductible_cents amount_cents, i.vorsteuer_cents, COALESCE(s.company,'') party,
                i.eur_category
         FROM incoming_invoices i
         LEFT JOIN suppliers s ON s.id=i.supplier_id
@@ -125,6 +125,7 @@ def euer_entries(connection, year: int) -> list[dict]:
             "party": row["party"],
             "category": row["eur_category"],
             "amount_cents": row["amount_cents"],
+            "vorsteuer_cents": row["vorsteuer_cents"],
         })
     return sorted(result, key=lambda item: (item["date"], item["kind"], item["source_id"]))
 
@@ -132,6 +133,7 @@ def euer_entries(connection, year: int) -> list[dict]:
 def euer_summary(entries: list[dict]) -> dict:
     income = sum(item["amount_cents"] for item in entries if item["kind"] == "Einnahme")
     expenses = sum(item["amount_cents"] for item in entries if item["kind"] == "Ausgabe")
+    vorsteuer = sum(item.get("vorsteuer_cents", 0) for item in entries if item["kind"] == "Ausgabe")
     categories: dict[str, int] = defaultdict(int)
     for item in entries:
         if item["kind"] == "Ausgabe":
@@ -140,6 +142,7 @@ def euer_summary(entries: list[dict]) -> dict:
         "income_cents": income,
         "expense_cents": expenses,
         "profit_cents": income - expenses,
+        "vorsteuer_cents": vorsteuer,
         "expense_categories": dict(sorted(categories.items())),
     }
 
@@ -153,6 +156,13 @@ def create_euer_csv(entries: list[dict]) -> bytes:
         writer.writerow((
             item["date"], item["kind"], item["source"], item["number"], item["party"],
             item["category"], f"{amount / 100:.2f}".replace(".", ","),
+        ))
+    summary = euer_summary(entries)
+    if summary["vorsteuer_cents"]:
+        writer.writerow((
+            "", "", "", "", "",
+            "Gezahlte Vorsteuer (informativ \u2013 ersetzt keine Umsatzsteuervoranmeldung)",
+            f"{summary['vorsteuer_cents'] / 100:.2f}".replace(".", ","),
         ))
     return ("\ufeff" + output.getvalue()).encode("utf-8")
 
@@ -198,7 +208,15 @@ def create_euer_pdf(
         ("INNERGRID", (0, 0), (-1, -1), .25, colors.HexColor("#cbd5e1")),
         ("PADDING", (0, 0), (-1, -1), 8),
     ]))
-    story.extend([totals, Spacer(1, 6 * mm), Paragraph("Zahlungsjournal", styles["Heading2"])])
+    story.append(totals)
+    if summary["vorsteuer_cents"]:
+        story.append(Spacer(1, 3 * mm))
+        story.append(Paragraph(
+            f"Gezahlte Vorsteuer (informativ – ersetzt keine Umsatzsteuervoranmeldung): "
+            f"<b>{money(summary['vorsteuer_cents'])}</b>",
+            styles["Normal"],
+        ))
+    story.extend([Spacer(1, 6 * mm), Paragraph("Zahlungsjournal", styles["Heading2"])])
 
     rows = [["Datum", "Art", "Beleg", "Geschäftspartner", "Kategorie", "Betrag"]]
     for item in entries:

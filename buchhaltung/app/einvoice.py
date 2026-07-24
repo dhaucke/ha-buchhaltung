@@ -4,7 +4,7 @@ import os
 import subprocess
 import tempfile
 from datetime import datetime
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 
 MUSTANG_CLI_JAR = os.environ.get("MUSTANG_CLI_JAR", "/opt/mustang/Mustang-CLI.jar")
@@ -76,10 +76,48 @@ def build_en16931_data(
             "Für ZUGFeRD fehlen Pflichtangaben: " + ", ".join(missing)
         )
     total = decimal_text(document["total_cents"])
-    notice = (
-        settings.get("small_business_notice")
-        or "Steuerbefreiung für Kleinunternehmer gemäß § 19 UStG."
-    )
+    tax_enabled = settings.get("small_business_enabled", "1") != "1"
+    if tax_enabled:
+        rate_groups: dict[int, dict[str, int]] = {}
+        for item in items:
+            rate_bp = item.get("tax_rate_bp", 0)
+            group = rate_groups.setdefault(rate_bp, {"net": 0, "tax": 0})
+            item_tax = int(
+                (Decimal(item["total_cents"]) * rate_bp / 10000).quantize(
+                    Decimal("1"), rounding=ROUND_HALF_UP
+                )
+            )
+            group["net"] += item["total_cents"]
+            group["tax"] += item_tax
+        net_total = sum(group["net"] for group in rate_groups.values())
+        tax_total = sum(group["tax"] for group in rate_groups.values())
+        bg_23 = [
+            {
+                "BT-116": decimal_text(amounts["net"]),
+                "BT-116-1": "EUR",
+                "BT-117": decimal_text(amounts["tax"]),
+                "BT-117-1": "EUR",
+                "BT-118": "S" if rate_bp > 0 else "Z",
+                "BT-119": f"{Decimal(rate_bp) / 100:.2f}",
+            }
+            for rate_bp, amounts in sorted(rate_groups.items())
+        ]
+    else:
+        notice = (
+            settings.get("small_business_notice")
+            or "Steuerbefreiung für Kleinunternehmer gemäß § 19 UStG."
+        )
+        net_total = document["total_cents"]
+        tax_total = 0
+        bg_23 = [{
+            "BT-116": total,
+            "BT-116-1": "EUR",
+            "BT-117": "0.00",
+            "BT-117-1": "EUR",
+            "BT-118": "E",
+            "BT-119": "0.00",
+            "BT-120": notice,
+        }]
     data = {
         "BT-1": document["document_number"],
         "BT-2": _date(document["issue_date"]),
@@ -113,23 +151,17 @@ def build_en16931_data(
         "BT-55": country_code(customer.get("country", "DE")),
         "BT-56": customer.get("contact_name", ""),
         "BT-58": customer["email"],
-        "BG-23": [{
-            "BT-116": total,
-            "BT-116-1": "EUR",
-            "BT-117": "0.00",
-            "BT-117-1": "EUR",
-            "BT-118": "E",
-            "BT-119": "0.00",
-            "BT-120": notice,
-        }],
-        "BT-106": total,
-        "BT-109": total,
-        "BT-110": "0.00",
+        "BG-23": bg_23,
+        "BT-106": decimal_text(net_total),
+        "BT-109": decimal_text(net_total),
+        "BT-110": decimal_text(tax_total),
         "BT-110-1": "EUR",
         "BT-112": total,
         "BT-115": total,
         "BG-25": [],
     }
+    if settings.get("vat_id"):
+        data["BT-31"] = settings["vat_id"]
     if document.get("due_date") and document["document_type"] == "invoice":
         data["BT-9"] = _date(document["due_date"])
     # Always set BT-72: if only BT-73/BT-74 (service period) are present,
@@ -158,6 +190,7 @@ def build_en16931_data(
         description = item["description"]
         if item.get("service_period"):
             description += f" – Leistungszeitraum: {item['service_period']}"
+        item_rate_bp = item.get("tax_rate_bp", 0) if tax_enabled else 0
         data["BG-25"].append({
             "BT-126": str(item["position"]),
             "BT-127": description,
@@ -165,8 +198,8 @@ def build_en16931_data(
             "BT-146": decimal_text(item["unit_price_cents"]),
             "BT-129": str(Decimal(item["quantity_milli"]) / 1000),
             "BT-130": unit_code(item.get("unit", "")),
-            "BT-151": "E",
-            "BT-152": "0.00",
+            "BT-151": ("S" if item_rate_bp > 0 else "Z") if tax_enabled else "E",
+            "BT-152": f"{Decimal(item_rate_bp) / 100:.2f}",
             "BT-131": decimal_text(item["total_cents"]),
         })
     return data

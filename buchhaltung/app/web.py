@@ -114,6 +114,16 @@ def form_values(form: dict, key: str) -> list[str]:
     return [str(value)]
 
 
+def tax_rate_bp_from_percent(value: str) -> int:
+    try:
+        rate = Decimal(str(value).strip().replace(",", "."))
+    except (InvalidOperation, ValueError):
+        return 0
+    if rate < 0 or rate > 100:
+        raise ValueError("Der Steuersatz muss zwischen 0 und 100 % liegen.")
+    return int((rate * 100).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+
+
 def document_items_from_form(form: dict) -> list[dict]:
     descriptions = form_values(form, "item_description")
     categories = form_values(form, "item_category")
@@ -121,6 +131,7 @@ def document_items_from_form(form: dict) -> list[dict]:
     quantities = form_values(form, "item_quantity")
     units = form_values(form, "item_unit")
     prices = form_values(form, "item_unit_price")
+    tax_rates = form_values(form, "item_tax_rate")
     result = []
     for index, description in enumerate(descriptions):
         description = description.strip()
@@ -146,6 +157,7 @@ def document_items_from_form(form: dict) -> list[dict]:
             "unit": (units[index].strip() if index < len(units) else "") or "pauschal",
             "unit_price_cents": unit_price,
             "total_cents": total,
+            "tax_rate_bp": tax_rate_bp_from_percent(tax_rates[index] if index < len(tax_rates) else "0"),
         })
     if not result:
         raise ValueError("Bitte mindestens eine Rechnungsposition vollständig ausfüllen.")
@@ -158,18 +170,62 @@ def replace_document_items(connection, document_id: int, items: list[dict]) -> N
         """
         INSERT INTO document_items(
             document_id, position, category, description, quantity_milli, unit,
-            unit_price_cents, total_cents, service_period
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            unit_price_cents, total_cents, service_period, tax_rate_bp
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         [
             (
                 document_id, item["position"], item["category"], item["description"],
                 item["quantity_milli"], item["unit"], item["unit_price_cents"],
-                item["total_cents"], item["service_period"],
+                item["total_cents"], item["service_period"], item.get("tax_rate_bp", 0),
             )
             for item in items
         ],
     )
+
+
+def document_totals(items: list[dict], settings: dict[str, str]) -> tuple[int, int, int]:
+    """Return (net_cents, tax_cents, gross_cents). Kleinunternehmer always nets to zero tax,
+    regardless of any tax_rate_bp submitted, so a stale form or a mode switch mid-edit can
+    never silently add VAT to an exempt invoice."""
+    net_total = sum(item["total_cents"] for item in items)
+    if settings.get("small_business_enabled", "1") == "1":
+        return net_total, 0, net_total
+    tax_total = sum(
+        int(
+            (Decimal(item["total_cents"]) * item.get("tax_rate_bp", 0) / 10000).quantize(
+                Decimal("1"), rounding=ROUND_HALF_UP
+            )
+        )
+        for item in items
+    )
+    return net_total, tax_total, net_total + tax_total
+
+
+def incoming_deductible_split(
+    gross_cents: int, share: int, tax_rate_bp: int, settings: dict[str, str]
+) -> tuple[int, int, int]:
+    """Return (deductible_cents, vorsteuer_cents, stored_tax_rate_bp) for an incoming
+    invoice. Kleinunternehmer always books the gross amount and zero Vorsteuer, regardless
+    of any tax_rate_bp submitted, matching the safety pattern in document_totals()."""
+    if settings.get("small_business_enabled", "1") == "1":
+        deductible = int(
+            (Decimal(gross_cents) * share / 100).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+        )
+        return deductible, 0, 0
+    net_cents = int(
+        (Decimal(gross_cents) * 10000 / (10000 + tax_rate_bp)).quantize(
+            Decimal("1"), rounding=ROUND_HALF_UP
+        )
+    )
+    vat_cents = gross_cents - net_cents
+    deductible = int(
+        (Decimal(net_cents) * share / 100).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+    )
+    vorsteuer = int(
+        (Decimal(vat_cents) * share / 100).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+    )
+    return deductible, vorsteuer, tax_rate_bp
 
 
 def archive_can_be_deleted(item) -> bool:
@@ -1071,6 +1127,9 @@ def document_form(
         f'{h(c["company"])} ({h(c["customer_number"])})</option>'
         for c in customers
     )
+    settings = DB.settings()
+    tax_enabled = settings.get("small_business_enabled", "1") != "1"
+    default_tax_rate_bp = int(settings.get("default_tax_rate_bp", "1900"))
     if not source_items:
         source_items = [{
             "category": "", "description": "", "service_period": "",
@@ -1086,8 +1145,15 @@ def document_form(
     service_end = editing["service_end"] if editing else ""
     action = f"/document/{document_id}/edit" if editing else "/document/new"
     item_cards = "".join(
-        document_item_editor(item, index)
+        document_item_editor(item, index, tax_enabled, default_tax_rate_bp)
         for index, item in enumerate(source_items, start=1)
+    )
+    totals_html = (
+        """<div class="position-total"><span>Nettosumme</span><strong id="document-net-total">0,00 €</strong></div>
+        <div class="position-total"><span>zzgl. Umsatzsteuer</span><strong id="document-tax-total">0,00 €</strong></div>
+        <div class="position-total"><span>Dokumentsumme</span><strong id="document-total">0,00 €</strong></div>"""
+        if tax_enabled else
+        """<div class="position-total"><span>Dokumentsumme</span><strong id="document-total">0,00 €</strong></div>"""
     )
     return f"""
     <form class="card form" method="post" action="{action}" id="document-form">
@@ -1106,7 +1172,7 @@ def document_form(
         Fertigstellen jederzeit bearbeitet werden.</p></div>
         <button class="button" type="button" id="add-position">Position hinzufügen</button></div>
         <div id="position-list">{item_cards}</div>
-        <div class="position-total"><span>Dokumentsumme</span><strong id="document-total">0,00 €</strong></div>
+        {totals_html}
       </div>
       <div class="form-grid"><label class="wide"><span>Hinweise</span>
       <textarea name="notes">{h(notes)}</textarea></label>
@@ -1116,12 +1182,13 @@ def document_form(
       <div class="form-actions"><a class="button" href="/documents?type={h(doc_type)}">Abbrechen</a>
       <button class="button primary">{'Änderungen speichern' if editing else 'Als Entwurf speichern'}</button></div>
     </form>
-    <template id="position-template">{document_item_editor({}, 0)}</template>
+    <template id="position-template">{document_item_editor({}, 0, tax_enabled, default_tax_rate_bp)}</template>
     <script>
     (() => {{
       const list = document.getElementById("position-list");
       const template = document.getElementById("position-template");
       const add = document.getElementById("add-position");
+      const taxEnabled = {"true" if tax_enabled else "false"};
       const parseMoney = value => {{
         let normalized = String(value || "").trim().replace(/\\s/g, "");
         if (normalized.includes(",")) normalized = normalized.replace(/\\./g, "").replace(",", ".");
@@ -1130,20 +1197,33 @@ def document_form(
       const parseQuantity = value => Number.parseFloat(String(value || "").replace(",", ".")) || 0;
       const moneyText = value => value.toLocaleString("de-DE", {{minimumFractionDigits: 2, maximumFractionDigits: 2}}) + " €";
       const update = () => {{
-        let sum = 0;
+        let netSum = 0;
+        let taxSum = 0;
         const cards = [...list.querySelectorAll(".position-card")];
         cards.forEach((card, index) => {{
           card.querySelector(".position-number").textContent = `Position ${{index + 1}}`;
-          const subtotal = parseQuantity(card.querySelector("[name=item_quantity]").value)
+          const netSubtotal = parseQuantity(card.querySelector("[name=item_quantity]").value)
             * parseMoney(card.querySelector("[name=item_unit_price]").value);
-          card.querySelector(".position-subtotal").textContent = moneyText(subtotal);
+          card.querySelector(".position-subtotal").textContent = moneyText(netSubtotal);
           card.querySelector(".remove-position").disabled = cards.length === 1;
-          sum += subtotal;
+          netSum += netSubtotal;
+          if (taxEnabled) {{
+            const rateField = card.querySelector("[name=item_tax_rate]");
+            const rate = rateField ? parseMoney(rateField.value) : 0;
+            taxSum += netSubtotal * rate / 100;
+          }}
         }});
-        document.getElementById("document-total").textContent = moneyText(sum);
+        if (taxEnabled) {{
+          document.getElementById("document-net-total").textContent = moneyText(netSum);
+          document.getElementById("document-tax-total").textContent = moneyText(taxSum);
+          document.getElementById("document-total").textContent = moneyText(netSum + taxSum);
+        }} else {{
+          document.getElementById("document-total").textContent = moneyText(netSum);
+        }}
       }};
       const wire = card => {{
         card.querySelectorAll("input").forEach(input => input.addEventListener("input", update));
+        card.querySelectorAll("select").forEach(select => select.addEventListener("change", update));
         card.querySelector(".remove-position").addEventListener("click", () => {{
           card.remove();
           update();
@@ -1163,7 +1243,9 @@ def document_form(
     </script>"""
 
 
-def document_item_editor(item: dict, index: int) -> str:
+def document_item_editor(
+    item: dict, index: int, tax_enabled: bool = False, default_tax_rate_bp: int = 1900,
+) -> str:
     quantity = Decimal(item.get("quantity_milli", 1000)) / 1000
     price = Decimal(item.get("unit_price_cents", 0)) / 100
     quantity_value = format(quantity.normalize(), "f").replace(".", ",")
@@ -1171,6 +1253,14 @@ def document_item_editor(item: dict, index: int) -> str:
         format(price, ".2f").replace(".", ",")
         if item.get("unit_price_cents") is not None else ""
     )
+    tax_rate_bp = item.get("tax_rate_bp", default_tax_rate_bp)
+    tax_field = ""
+    if tax_enabled:
+        tax_options = "".join(
+            f'<option value="{rate}" {"selected" if rate * 100 == tax_rate_bp else ""}>{rate} %</option>'
+            for rate in (19, 7, 0)
+        )
+        tax_field = f'<label><span>USt-Satz</span><select name="item_tax_rate">{tax_options}</select></label>'
     return f"""
     <article class="position-card">
       <div class="position-card-head"><strong class="position-number">Position {index or ''}</strong>
@@ -1182,6 +1272,7 @@ def document_item_editor(item: dict, index: int) -> str:
         <label><span>Menge *</span><input required name="item_quantity" inputmode="decimal" value="{h(quantity_value)}"></label>
         <label><span>Einheit *</span><input required name="item_unit" value="{h(item.get('unit', 'pauschal'))}"></label>
         <label><span>Einzelpreis in EUR *</span><input required name="item_unit_price" inputmode="decimal" value="{h(price_value)}"></label>
+        {tax_field}
       </div>
       <div class="position-subtotal-row"><span>Positionssumme</span><strong class="position-subtotal">0,00 €</strong></div>
     </article>"""
@@ -1195,9 +1286,12 @@ def document_detail(connection, document_id: int) -> str:
     electronic = connection.execute(
         "SELECT * FROM e_invoice_files WHERE document_id=?", (document_id,)
     ).fetchone()
+    tax_shown = document.get("tax_cents", 0) > 0
     item_rows = "".join(
         f"<tr><td>{i['position']}</td><td>{h(i['description'])}</td><td>{h(i['service_period'])}</td>"
-        f"<td class='money'>{money(i['unit_price_cents'])}</td><td class='money'>{money(i['total_cents'])}</td></tr>"
+        f"<td class='money'>{money(i['unit_price_cents'])}</td>"
+        + (f"<td class='money'>{Decimal(i.get('tax_rate_bp', 0)) / 100:g}%</td>" if tax_shown else "")
+        + f"<td class='money'>{money(i['total_cents'])}</td></tr>"
         for i in items
     )
     actions = []
@@ -1289,9 +1383,14 @@ def document_detail(connection, document_id: int) -> str:
       <div><span>Betreff</span><strong>{h(document['title'])}</strong></div></div>
       {f'<p class="notice"><b>Grund:</b> {h(document["credit_reason"])}</p>'
       if document["document_type"] == "credit" and document.get("credit_reason") else ""}
-      <table><thead><tr><th>Pos.</th><th>Leistung</th><th>Zeitraum</th><th>Einzelpreis</th><th>Gesamt</th></tr></thead>
+      <table><thead><tr><th>Pos.</th><th>Leistung</th><th>Zeitraum</th><th>Einzelpreis</th>
+      {'<th>USt.</th>' if tax_shown else ''}<th>Gesamt</th></tr></thead>
       <tbody>{item_rows}</tbody></table>
-      <div class="grand-total"><span>Gesamtbetrag</span><strong>{money(document['total_cents'])}</strong></div>
+      {f'''<div class="grand-total"><span>Nettobetrag</span><strong>{money(document["total_cents"] - document["tax_cents"])}</strong></div>
+      <div class="grand-total"><span>zzgl. Umsatzsteuer</span><strong>{money(document["tax_cents"])}</strong></div>
+      <div class="grand-total"><span>Gesamtbetrag</span><strong>{money(document["total_cents"])}</strong></div>'''
+      if tax_shown else
+      f'<div class="grand-total"><span>Gesamtbetrag</span><strong>{money(document["total_cents"])}</strong></div>'}
       {tax_notice}
     </div>"""
 
@@ -2196,6 +2295,25 @@ def incoming_detail(connection, incoming_id: int) -> str:
     gross = f"{item['gross_cents'] / 100:.2f}".replace(".", ",")
     editable = item["status"] in ("draft", "booked")
     readonly = "" if editable else "disabled"
+    settings = DB.settings()
+    tax_enabled = settings.get("small_business_enabled", "1") != "1"
+    tax_field = ""
+    vorsteuer_info = ""
+    if tax_enabled:
+        rate_bp = item["tax_rate_bp"] or int(settings.get("default_tax_rate_bp", "1900"))
+        tax_options = "".join(
+            f'<option value="{rate}" {"selected" if rate * 100 == rate_bp else ""}>{rate} %</option>'
+            for rate in (19, 7, 0)
+        )
+        tax_field = (
+            f'<label><span>USt-Satz im Beleg</span>'
+            f'<select {readonly} name="incoming_tax_rate">{tax_options}</select></label>'
+        )
+        vorsteuer_info = (
+            f'<p class="muted">Davon Vorsteuer: {money(item["vorsteuer_cents"])} '
+            f'(Nettoausgabe: {money(item["deductible_cents"])}, jeweils bei '
+            f'{item["business_share_percent"]}% betrieblichem Anteil).</p>'
+        )
     delete = (
         f'<form method="post" action="/incoming/{incoming_id}/delete" '
         f'onsubmit="return confirm(\'Entwurf und zugehörige PDF endgültig löschen?\')">'
@@ -2238,10 +2356,12 @@ def incoming_detail(connection, incoming_id: int) -> str:
         <label><span>Zahlungsdatum</span><input {readonly} type="date" name="payment_date" value="{h(payment_value)}"></label>
         <label><span>Bruttobetrag in EUR *</span><input {readonly} required name="gross_amount" value="{h(gross)}"></label>
         <label><span>Betrieblicher Anteil in %</span><input {readonly} type="number" min="0" max="100" name="business_share_percent" value="{item['business_share_percent']}"></label>
+        {tax_field}
         <label class="wide"><span>EÜR-Kategorie *</span><select {readonly} name="eur_category">{category_options}</select></label>
         <label class="wide"><span>Beschreibung</span><input {readonly} name="description" value="{h(item['description'])}"></label>
         <label class="wide"><span>Notizen / Prüfvermerk</span><textarea {readonly} name="notes">{h(item['notes'])}</textarea></label>
       </div>
+      {vorsteuer_info}
       <p class="notice">Bei Kleinunternehmern wird grundsätzlich der Bruttobetrag als Ausgabe
       verwendet. Sonderfälle – insbesondere AfA, Bewirtung und private Anteile – müssen
       steuerlich geprüft werden.</p>
@@ -2291,6 +2411,10 @@ def euer_page(connection, year: int) -> str:
         f"<td>{h(item['category'])}</td><td class='money'>{money(item['amount_cents'] if item['kind'] == 'Einnahme' else -item['amount_cents'])}</td></tr>"
         for item in entries
     ) or '<tr><td colspan="6" class="empty">Für dieses Jahr wurden noch keine Zahlungen erfasst.</td></tr>'
+    vorsteuer_stat = (
+        f"<article><span>Gezahlte Vorsteuer</span><strong>{money(summary['vorsteuer_cents'])}</strong></article>"
+        if summary["vorsteuer_cents"] else ""
+    )
     return f"""
     <form class="filter-bar" method="get" action="/reports/euer">
       <label><span>Auswertungsjahr</span><select name="year">{options}</select></label>
@@ -2302,6 +2426,7 @@ def euer_page(connection, year: int) -> str:
       <article><span>Betriebseinnahmen</span><strong>{money(summary['income_cents'])}</strong></article>
       <article><span>Betriebsausgaben</span><strong>{money(summary['expense_cents'])}</strong></article>
       <article><span>Vorläufiger Überschuss</span><strong>{money(summary['profit_cents'])}</strong></article>
+      {vorsteuer_stat}
     </div>
     <div class="card"><div class="card-head"><h2>Ausgaben nach Kategorie</h2></div>
       <div class="table-wrap"><table><thead><tr><th>Kategorie</th><th>Betrag</th></tr></thead><tbody>{category_rows}</tbody></table></div>
@@ -2335,8 +2460,8 @@ def settings_page(settings: dict[str, str]) -> str:
         ("company_name", "Unternehmensname"), ("owner_name", "Inhaber"), ("street", "Straße"),
         ("postal_code", "PLZ"), ("city", "Ort"), ("country", "Land"),
         ("phone", "Telefon"), ("email", "E-Mail"),
-        ("website", "Website"), ("tax_number", "Steuernummer"), ("iban", "IBAN"), ("bic", "BIC"),
-        ("bank_name", "Bank"),
+        ("website", "Website"), ("tax_number", "Steuernummer"), ("vat_id", "USt-IdNr"),
+        ("iban", "IBAN"), ("bic", "BIC"), ("bank_name", "Bank"),
     ]
     inputs = "".join(
         f'<label><span>{h(label)}</span><input name="{h(key)}" value="{h(settings.get(key, ""))}"></label>'
@@ -2372,6 +2497,11 @@ def settings_page(settings: dict[str, str]) -> str:
 
 def settings_billing_page(settings: dict[str, str]) -> str:
     checked = "checked" if settings.get("small_business_enabled", "1") == "1" else ""
+    default_rate = settings.get("default_tax_rate_bp", "1900")
+    rate_options = "".join(
+        f'<option value="{rate}" {"selected" if str(rate * 100) == default_rate else ""}>{rate}%</option>'
+        for rate in (19, 7, 0)
+    )
     return f"""
     {settings_tabs("rechnungswesen")}
     <form class="card form" method="post" action="/settings" enctype="multipart/form-data">
@@ -2387,6 +2517,8 @@ def settings_billing_page(settings: dict[str, str]) -> str:
       value="{h(settings.get('reminder_interval_days', '7'))}"></label>
       <label class="check wide"><input type="checkbox" name="small_business_enabled" {checked}>
       <span>Kleinunternehmerregelung nach § 19 UStG verwenden</span></label>
+      <label><span>Standard-Umsatzsteuersatz für neue Positionen</span>
+      <select name="default_tax_rate_bp">{rate_options}</select></label>
       <label class="wide"><span>Kleinunternehmer-Hinweis</span>
       <input name="small_business_notice" value="{h(settings.get('small_business_notice'))}"></label>
       <label class="wide"><span>E-Mail-Text beim Rechnungs-/Gutschriftversand</span>
@@ -2969,19 +3101,19 @@ def application(environ, start_response):
                 terms = int(settings["payment_terms_days"])
                 due_date = (date.fromisoformat(issue_date) + timedelta(days=terms)).isoformat() if doc_type == "invoice" else None
                 items = document_items_from_form(form)
-                total = sum(item["total_cents"] for item in items)
+                _, tax_total, total = document_totals(items, settings)
                 now = Database.now()
                 cursor = connection.execute(
                     """
                     INSERT INTO documents(document_type, status, customer_id, issue_date, service_start, service_end,
                     due_date, payment_terms_days, title, notes, source_document_id, credit_reason,
-                    total_cents, created_at, updated_at)
-                    VALUES (?, 'draft', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    total_cents, tax_cents, created_at, updated_at)
+                    VALUES (?, 'draft', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (doc_type, int(form["customer_id"]), issue_date, form.get("service_start") or None,
                      form.get("service_end") or None, due_date, terms, form.get("title", ""),
                      form.get("notes", ""), int(form["source_document_id"]) if form.get("source_document_id") else None,
-                     form.get("credit_reason", ""), total, now, now),
+                     form.get("credit_reason", ""), total, tax_total, now, now),
                 )
                 document_id = cursor.lastrowid
                 replace_document_items(connection, document_id, items)
@@ -3005,26 +3137,27 @@ def application(environ, start_response):
                 if not document or document["status"] != "draft":
                     raise ValueError("Nur Entwürfe können bearbeitet werden.")
                 form = parse_form(environ)
+                settings = DB.settings()
                 issue_date = form["issue_date"]
-                terms = int(DB.settings()["payment_terms_days"])
+                terms = int(settings["payment_terms_days"])
                 due_date = (
                     date.fromisoformat(issue_date) + timedelta(days=terms)
                 ).isoformat() if document["document_type"] == "invoice" else None
                 items = document_items_from_form(form)
-                total = sum(item["total_cents"] for item in items)
+                _, tax_total, total = document_totals(items, settings)
                 now = Database.now()
                 connection.execute(
                     """
                     UPDATE documents SET customer_id=?, issue_date=?, service_start=?,
                     service_end=?, due_date=?, payment_terms_days=?, title=?, notes=?,
-                    credit_reason=?, total_cents=?, updated_at=? WHERE id=?
+                    credit_reason=?, total_cents=?, tax_cents=?, updated_at=? WHERE id=?
                     """,
                     (
                         int(form["customer_id"]), issue_date,
                         form.get("service_start") or None,
                         form.get("service_end") or None, due_date, terms,
                         form.get("title", ""), form.get("notes", ""),
-                        form.get("credit_reason", ""), total, now, document_id,
+                        form.get("credit_reason", ""), total, tax_total, now, document_id,
                     ),
                 )
                 replace_document_items(connection, document_id, items)
@@ -3632,25 +3765,26 @@ def application(environ, start_response):
                     raise ValueError("Für eine bezahlte Eingangsrechnung ist das Zahlungsdatum erforderlich.")
                 gross_cents = cents(str(form.get("gross_amount", "0")))
                 share = max(0, min(100, int(str(form.get("business_share_percent", "100")))))
-                deductible = int(
-                    (Decimal(gross_cents) * Decimal(share) / 100).quantize(
-                        Decimal("1"), rounding=ROUND_HALF_UP
-                    )
+                settings = DB.settings()
+                tax_rate_bp = tax_rate_bp_from_percent(str(form.get("incoming_tax_rate", "0")))
+                deductible, vorsteuer, stored_rate_bp = incoming_deductible_split(
+                    gross_cents, share, tax_rate_bp, settings
                 )
                 connection.execute(
                     """
                     UPDATE incoming_invoices SET supplier_id=?, invoice_number=?,
                     invoice_date=?, due_date=?, payment_date=?, status=?, description=?,
                     eur_category=?, gross_cents=?, business_share_percent=?,
-                    deductible_cents=?, notes=?, booked_at=COALESCE(booked_at,?),
-                    updated_at=? WHERE id=?
+                    deductible_cents=?, tax_rate_bp=?, vorsteuer_cents=?, notes=?,
+                    booked_at=COALESCE(booked_at,?), updated_at=? WHERE id=?
                     """,
                     (
                         supplier_id, str(form.get("invoice_number", "")).strip(),
                         str(form.get("invoice_date", "")), str(form.get("due_date", "")) or None,
                         payment_date, action, str(form.get("description", "")).strip(),
                         str(form.get("eur_category", "Fremdleistungen")),
-                        gross_cents, share, deductible, str(form.get("notes", "")).strip(),
+                        gross_cents, share, deductible, stored_rate_bp, vorsteuer,
+                        str(form.get("notes", "")).strip(),
                         now, now, incoming_id,
                     ),
                 )
@@ -3844,6 +3978,10 @@ def application(environ, start_response):
                             raise ValueError(f"{label} müssen eine ganze Zahl sein.") from exc
                         if not 0 <= days <= 90:
                             raise ValueError(f"{label} müssen zwischen 0 und 90 Tagen liegen.")
+                if "default_tax_rate_bp" in values:
+                    values["default_tax_rate_bp"] = str(
+                        tax_rate_bp_from_percent(values["default_tax_rate_bp"])
+                    )
                 DB.update_settings(values)
                 return_to = form.get("return_to")
                 if return_to not in (

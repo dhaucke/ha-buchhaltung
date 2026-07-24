@@ -50,6 +50,7 @@ CREATE TABLE IF NOT EXISTS documents (
     settlement_type TEXT NOT NULL DEFAULT '',
     settled_at TEXT,
     total_cents INTEGER NOT NULL DEFAULT 0,
+    tax_cents INTEGER NOT NULL DEFAULT 0,
     finalized_at TEXT,
     sent_at TEXT,
     paid_at TEXT,
@@ -68,7 +69,8 @@ CREATE TABLE IF NOT EXISTS document_items (
     unit TEXT NOT NULL DEFAULT 'pauschal',
     unit_price_cents INTEGER NOT NULL DEFAULT 0,
     total_cents INTEGER NOT NULL DEFAULT 0,
-    service_period TEXT NOT NULL DEFAULT ''
+    service_period TEXT NOT NULL DEFAULT '',
+    tax_rate_bp INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS archive_files (
@@ -128,6 +130,8 @@ CREATE TABLE IF NOT EXISTS incoming_invoices (
     business_share_percent INTEGER NOT NULL DEFAULT 100
         CHECK(business_share_percent BETWEEN 0 AND 100),
     deductible_cents INTEGER NOT NULL DEFAULT 0,
+    tax_rate_bp INTEGER NOT NULL DEFAULT 0,
+    vorsteuer_cents INTEGER NOT NULL DEFAULT 0,
     notes TEXT NOT NULL DEFAULT '',
     booked_at TEXT,
     cancelled_at TEXT,
@@ -234,11 +238,13 @@ DEFAULT_SETTINGS = {
     "email": "",
     "website": "",
     "tax_number": "",
+    "vat_id": "",
     "iban": "",
     "bic": "",
     "bank_name": "",
     "small_business_enabled": "1",
     "small_business_notice": "Steuerbefreiung für Kleinunternehmer gemäß § 19 UStG.",
+    "default_tax_rate_bp": "1900",
     "payment_terms_days": "14",
     "reminder_grace_days": "3",
     "reminder_interval_days": "7",
@@ -347,6 +353,7 @@ class Database:
                 "credit_reason": "TEXT NOT NULL DEFAULT ''",
                 "settlement_type": "TEXT NOT NULL DEFAULT ''",
                 "settled_at": "TEXT",
+                "tax_cents": "INTEGER NOT NULL DEFAULT 0",
             }
             for column, definition in document_migrations.items():
                 if column not in document_columns:
@@ -368,6 +375,25 @@ class Database:
                     "ALTER TABLE recurring_invoices ADD COLUMN send_format "
                     "TEXT NOT NULL DEFAULT 'auto'"
                 )
+            item_columns = {
+                row["name"] for row in connection.execute("PRAGMA table_info(document_items)")
+            }
+            if "tax_rate_bp" not in item_columns:
+                connection.execute(
+                    "ALTER TABLE document_items ADD COLUMN tax_rate_bp INTEGER NOT NULL DEFAULT 0"
+                )
+            incoming_columns = {
+                row["name"] for row in connection.execute("PRAGMA table_info(incoming_invoices)")
+            }
+            incoming_migrations = {
+                "tax_rate_bp": "INTEGER NOT NULL DEFAULT 0",
+                "vorsteuer_cents": "INTEGER NOT NULL DEFAULT 0",
+            }
+            for column, definition in incoming_migrations.items():
+                if column not in incoming_columns:
+                    connection.execute(
+                        f"ALTER TABLE incoming_invoices ADD COLUMN {column} {definition}"
+                    )
             self.link_archives_by_customer_number(connection)
 
     def settings(self) -> dict[str, str]:
