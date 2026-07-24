@@ -30,7 +30,7 @@ RUN apk add --no-cache \
 
 COPY app /app
 COPY run.sh /run.sh
-RUN chmod +x /run.sh && mkdir -p /data/documents /data/archive
+RUN chmod +x /run.sh && mkdir -p /data/documents /data/archive /data/reports
 
 WORKDIR /app
 EXPOSE 8099

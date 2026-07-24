@@ -10,6 +10,7 @@ import sqlite3
 import urllib.parse
 import base64
 import calendar
+import unicodedata
 import threading
 import time
 from io import BytesIO
@@ -26,6 +27,7 @@ from PIL import Image as PillowImage, UnidentifiedImageError
 
 from db import Database
 from graph import GraphClient
+from euer import EXPENSE_CATEGORIES, create_euer_csv, create_euer_pdf, euer_entries, euer_summary
 from pdfgen import TYPE_LABELS, create_document_pdf, german_date, money
 from pdfimport import analyze_invoice_pdf
 
@@ -69,10 +71,16 @@ def parse_form(environ) -> dict:
             filename = part.get_filename()
             payload = part.get_payload(decode=True) or b""
             if filename:
-                result[name] = UploadedFile(filename, part.get_content_type(), payload)
+                value = UploadedFile(filename, part.get_content_type(), payload)
             else:
                 charset = part.get_content_charset() or "utf-8"
-                result[name] = payload.decode(charset, errors="replace")
+                value = payload.decode(charset, errors="replace")
+            if name in result:
+                if not isinstance(result[name], list):
+                    result[name] = [result[name]]
+                result[name].append(value)
+            else:
+                result[name] = value
         return result
     raw = raw_bytes.decode("utf-8")
     return {key: values[-1] for key, values in urllib.parse.parse_qs(raw, keep_blank_values=True).items()}
@@ -83,6 +91,11 @@ class UploadedFile:
         self.filename = filename
         self.type = content_type
         self.data = data
+
+
+def uploaded_files(value) -> list[UploadedFile]:
+    values = value if isinstance(value, list) else [value]
+    return [item for item in values if isinstance(item, UploadedFile) and item.filename]
 
 
 def cents(value: str) -> int:
@@ -176,7 +189,9 @@ def layout(title: str, body: str, active: str = "") -> str:
         ("/documents?type=offer", "offer", "Angebote"),
         ("/documents?type=order", "order", "Aufträge"),
         ("/documents?type=invoice", "invoice", "Rechnungen"),
+        ("/incoming", "incoming", "Eingangsrechnungen"),
         ("/archive", "archive", "Archiv"),
+        ("/reports/euer", "reports", "EÜR"),
         ("/settings", "settings", "Einstellungen"),
     ]
     links = "".join(
@@ -366,7 +381,7 @@ def dashboard(connection) -> str:
             "SELECT count(*) FROM documents WHERE document_type='invoice' AND status IN ('final','sent')"
         ).fetchone()[0],
         "paid": connection.execute(
-            "SELECT COALESCE(sum(total_cents),0) FROM documents WHERE document_type='invoice' AND status='paid' AND substr(issue_date,1,4)=?",
+            "SELECT COALESCE(sum(total_cents),0) FROM documents WHERE document_type='invoice' AND status='paid' AND substr(paid_at,1,4)=?",
             (str(date.today().year),),
         ).fetchone()[0],
         "outstanding": connection.execute(
@@ -608,6 +623,11 @@ def document_detail(connection, document_id: int) -> str:
     actions = []
     if document["status"] == "draft":
         actions.append(f'<form method="post" action="/document/{document_id}/finalize"><button class="button primary">Fertigstellen & PDF erzeugen</button></form>')
+        actions.append(
+            f'<form method="post" action="/document/{document_id}/delete" '
+            f'onsubmit="return confirm(\'Diesen Entwurf endgültig löschen?\')">'
+            f'<button class="button danger">Entwurf löschen</button></form>'
+        )
     if document["status"] in ("final", "sent"):
         actions.append(f'<a class="button" href="/document/{document_id}/pdf">PDF öffnen</a>')
         if document["customer_email"]:
@@ -617,7 +637,17 @@ def document_detail(connection, document_id: int) -> str:
     if document["document_type"] == "order" and document["status"] in ("final", "sent", "accepted"):
         actions.append(f'<form method="post" action="/document/{document_id}/convert?to=invoice"><button class="button primary">Rechnung erstellen</button></form>')
     if document["document_type"] == "invoice" and document["status"] in ("final", "sent"):
-        actions.append(f'<form method="post" action="/document/{document_id}/paid"><button class="button primary">Als bezahlt markieren</button></form>')
+        actions.append(
+            f'<form class="payment-action" method="post" action="/document/{document_id}/paid">'
+            f'<input aria-label="Zahlungsdatum" required type="date" name="payment_date" '
+            f'value="{date.today().isoformat()}"><button class="button primary">Als bezahlt markieren</button></form>'
+        )
+    if document["status"] not in ("draft", "cancelled", "paid"):
+        actions.append(
+            f'<form method="post" action="/document/{document_id}/cancel" '
+            f'onsubmit="return confirm(\'Dokument stornieren? Der Beleg bleibt erhalten.\')">'
+            f'<button class="button danger">Stornieren</button></form>'
+        )
     settings = DB.settings()
     tax_notice = (
         f'<p class="notice">{h(settings.get("small_business_notice"))}</p>'
@@ -869,15 +899,19 @@ def archive_page(connection) -> str:
     files = rows(
         connection,
         """
-        SELECT a.*, d.document_number, c.company AS imported_customer FROM archive_files a
+        SELECT a.*, d.document_number, c.company AS imported_customer,
+               i.id AS incoming_invoice_id
+        FROM archive_files a
         LEFT JOIN customers c ON c.id=a.customer_id
         LEFT JOIN documents d ON d.id=a.document_id
+        LEFT JOIN incoming_invoices i ON i.archive_file_id=a.id
         ORDER BY a.uploaded_at DESC
         """,
     )
     file_rows = "".join(
         f"<tr><td><strong>{h(f['original_filename'])}</strong></td>"
-        f"<td>{h(f['detected_invoice_number'] or f['document_number'] or 'Noch nicht erkannt')}</td>"
+        f"<td><span class='status'>{'Eingang' if f['document_direction'] == 'incoming' else 'Ausgang'}</span><br>"
+        f"{h(f['detected_invoice_number'] or f['document_number'] or 'Noch nicht erkannt')}</td>"
         f"<td>{h(f['detected_customer_name'] or '–')}"
         f"{f'<br><small>Kd.-Nr. {h(f['detected_customer_number'])}</small>' if f['detected_customer_number'] else ''}</td>"
         f"<td>{german_date(f['detected_issue_date']) if f['detected_issue_date'] else '–'}</td>"
@@ -885,19 +919,34 @@ def archive_page(connection) -> str:
         f"<td><div class='row-actions'><a class='button compact' href='/archive/{f['id']}'>Prüfen</a>"
         f"<a class='button compact' target='_blank' href='/archive/{f['id']}/pdf'>Öffnen</a>"
         f"<form method='post' action='/archive/{f['id']}/analyze'><button class='button compact'>Neu analysieren</button></form>"
-        f"</div></td></tr>"
+        + (
+            f"<form method='post' action='/archive/{f['id']}/delete' "
+            f"onsubmit=\"return confirm('Fehlimport und PDF endgültig löschen?')\">"
+            f"<button class='button compact danger'>Löschen</button></form>"
+            if not f["document_id"] and not f["incoming_invoice_id"]
+            and f["accounting_status"] == "unbooked" and not f["customer_id"]
+            else ""
+        )
+        + f"</div></td></tr>"
         for f in files
     ) or '<tr><td colspan="6" class="empty">Noch keine alten Rechnungen importiert.</td></tr>'
     return f"""
     <div class="card form">
-      <h2>Alte PDF-Rechnung importieren</h2>
-      <p class="muted">Die Originaldatei bleibt unverändert. Nummer, Datum, Betrag und Kundenanschrift werden automatisch ausgelesen.</p>
+      <h2>PDF-Belege importieren</h2>
+      <p class="muted">Bis zu 50 PDFs gemeinsam auswählen. Die Originaldateien bleiben
+      unverändert; erkannte Daten werden anschließend einzeln geprüft.</p>
       <form method="post" action="/archive/upload" enctype="multipart/form-data">
-      <div class="form-grid"><label class="wide"><span>PDF-Datei *</span><input required type="file" name="pdf" accept="application/pdf"></label>
-      <label><span>Rechnungsnummer</span><input name="document_number" placeholder="2026-06-0132"></label>
+      <div class="form-grid">
+      <label><span>Belegart *</span><select name="document_direction">
+        <option value="outgoing">Ausgangsrechnungen</option>
+        <option value="incoming">Eingangsrechnungen</option>
+      </select></label>
+      <label class="wide"><span>PDF-Dateien * (maximal 50)</span>
+      <input required multiple type="file" name="pdf" accept="application/pdf"></label>
+      <label><span>Rechnungsnummer</span><input name="document_number" placeholder="nur bei Einzelimport"></label>
       <label><span>Rechnungsdatum</span><input type="date" name="issue_date"></label>
       <label><span>Betrag in EUR</span><input name="amount" inputmode="decimal"></label></div>
-      <div class="form-actions"><button class="button primary">Hochladen und analysieren</button></div></form>
+      <div class="form-actions"><button class="button primary">Belege hochladen und analysieren</button></div></form>
     </div>
     <div class="card"><div class="table-wrap"><table><thead><tr><th>Datei</th><th>Nummer</th><th>Kunde</th><th>Datum</th><th>Betrag</th><th>Aktionen</th></tr></thead>
     <tbody>{file_rows}</tbody></table></div></div>"""
@@ -906,8 +955,10 @@ def archive_page(connection) -> str:
 def archive_detail(connection, archive_id: int) -> str:
     item = connection.execute(
         """
-        SELECT a.*, c.company AS imported_customer, c.customer_number
+        SELECT a.*, c.company AS imported_customer, c.customer_number,
+               i.id AS incoming_invoice_id
         FROM archive_files a LEFT JOIN customers c ON c.id=a.customer_id
+        LEFT JOIN incoming_invoices i ON i.archive_file_id=a.id
         WHERE a.id=?
         """,
         (archive_id,),
@@ -927,18 +978,55 @@ def archive_detail(connection, archive_id: int) -> str:
         f'<div class="alert error">{h(item["analysis_error"])}</div>'
         if item["analysis_error"] else ""
     )
+    is_incoming = item["document_direction"] == "incoming"
     customer_button = (
         ""
-        if item["customer_id"] else
+        if item["customer_id"] or is_incoming else
         f"""<button class="button primary" type="submit"
         form="archive-customer-import">Kundendaten übernehmen</button>"""
     )
+    incoming_button = (
+        f'<form method="post" action="/archive/{archive_id}/incoming">'
+        f'<button class="button primary">Als Eingangsrechnung erfassen</button></form>'
+        if is_incoming and not item["incoming_invoice_id"] else
+        (
+            f'<a class="button primary" href="/incoming/{item["incoming_invoice_id"]}">'
+            f'Eingangsrechnung öffnen</a>'
+            if item["incoming_invoice_id"] else ""
+        )
+    )
+    delete_button = (
+        f'<form method="post" action="/archive/{archive_id}/delete" '
+        f'onsubmit="return confirm(\'Fehlimport und PDF endgültig löschen?\')">'
+        f'<button class="button danger">Fehlimport löschen</button></form>'
+        if not item["customer_id"] and not item["incoming_invoice_id"]
+        and not item["document_id"] and item["accounting_status"] == "unbooked"
+        else ""
+    )
+    payment_form = ""
+    if not is_incoming:
+        payment_form = f"""
+        <form class="card form" method="post" action="/archive/{archive_id}/payment">
+          <h2>Zahlung für EÜR</h2>
+          <p class="muted">Historische Ausgangsrechnungen werden erst mit einem
+          Zahlungsdatum als Betriebseinnahme berücksichtigt.</p>
+          <div class="form-grid">
+            <label><span>Status</span><select name="accounting_status">
+              <option value="unbooked" {'selected' if item['accounting_status'] == 'unbooked' else ''}>Noch nicht bezahlt</option>
+              <option value="paid" {'selected' if item['accounting_status'] == 'paid' else ''}>Bezahlt</option>
+              <option value="cancelled" {'selected' if item['accounting_status'] == 'cancelled' else ''}>Storniert</option>
+            </select></label>
+            <label><span>Zahlungsdatum</span><input type="date" name="payment_date" value="{h(item['payment_date'])}"></label>
+          </div>
+          <div class="form-actions"><button class="button">Zahlungsstatus speichern</button></div>
+        </form>"""
     return f"""
     {state}{warning}
     <form id="archive-customer-import" method="post" action="/archive/{archive_id}/customer"></form>
     <div class="actions">
       <a class="button" target="_blank" href="/archive/{archive_id}/pdf">Original-PDF öffnen</a>
       <form method="post" action="/archive/{archive_id}/analyze"><button class="button">Neu analysieren</button></form>
+      {incoming_button}{delete_button}
     </div>
     <form class="card form" method="post" action="/archive/{archive_id}/metadata">
       <h2>Erkannte Daten prüfen</h2>
@@ -947,7 +1035,7 @@ def archive_detail(connection, archive_id: int) -> str:
         <label><span>Rechnungsnummer</span><input name="invoice_number" value="{h(item['detected_invoice_number'])}"></label>
         <label><span>Rechnungsdatum</span><input type="date" name="issue_date" value="{h(item['detected_issue_date'])}"></label>
         <label><span>Rechnungsbetrag in EUR</span><input name="amount" value="{h(amount_value)}"></label>
-        <label><span>Unternehmen / Kunde *</span><input name="customer_name" value="{h(item['detected_customer_name'])}"></label>
+        <label><span>{'Lieferant / Aussteller' if is_incoming else 'Unternehmen / Kunde *'}</span><input name="customer_name" value="{h(item['detected_customer_name'])}"></label>
         <label><span>Erkannte Kundennummer</span><input name="customer_number" value="{h(item['detected_customer_number'])}"></label>
         <label><span>Straße</span><input name="street" value="{h(item['detected_street'])}"></label>
         <label><span>PLZ</span><input name="postal_code" value="{h(item['detected_postal_code'])}"></label>
@@ -955,6 +1043,7 @@ def archive_detail(connection, archive_id: int) -> str:
       </div>
       <div class="form-actions"><button class="button">Korrekturen speichern</button>{customer_button}</div>
     </form>
+    {payment_form}
     <details class="card extracted"><summary>Erkannten PDF-Text anzeigen</summary>
       <pre>{h(item['extracted_text'])}</pre>
     </details>"""
@@ -976,6 +1065,152 @@ def update_archive_analysis(connection, archive_id: int, result: dict):
             archive_id,
         ),
     )
+
+
+def incoming_page(connection) -> str:
+    invoices = rows(
+        connection,
+        """
+        SELECT i.*, COALESCE(s.company,'Noch nicht zugeordnet') supplier,
+               a.original_filename
+        FROM incoming_invoices i
+        LEFT JOIN suppliers s ON s.id=i.supplier_id
+        LEFT JOIN archive_files a ON a.id=i.archive_file_id
+        ORDER BY i.invoice_date DESC, i.id DESC
+        """,
+    )
+    status_labels = {
+        "draft": "Entwurf", "booked": "Gebucht", "paid": "Bezahlt", "cancelled": "Storniert"
+    }
+    invoice_rows = "".join(
+        f"""<tr><td><a href="/incoming/{item['id']}"><strong>{h(item['invoice_number'] or 'Ohne Nummer')}</strong></a></td>
+        <td>{h(item['supplier'])}</td><td>{german_date(item['invoice_date'])}</td>
+        <td>{german_date(item['payment_date']) if item['payment_date'] else '–'}</td>
+        <td>{h(item['eur_category'])}</td><td class="money">{money(item['deductible_cents'])}</td>
+        <td><span class="status {h(item['status'])}">{h(status_labels[item['status']])}</span></td></tr>"""
+        for item in invoices
+    ) or '<tr><td colspan="7" class="empty">Noch keine Eingangsrechnungen erfasst.</td></tr>'
+    return f"""
+    <div class="actions"><a class="button primary" href="/archive">PDFs importieren</a></div>
+    <div class="card">
+      <div class="card-head"><h2>Eingangsrechnungen</h2>
+      <p class="muted">Belege werden zuerst im Archiv importiert und anschließend hier
+      als Ausgabe gebucht. Für die EÜR ist das Zahlungsdatum maßgeblich.</p></div>
+      <div class="table-wrap"><table><thead><tr><th>Rechnungsnummer</th><th>Lieferant</th>
+      <th>Rechnungsdatum</th><th>Bezahlt am</th><th>EÜR-Kategorie</th>
+      <th>Abziehbarer Betrag</th><th>Status</th></tr></thead><tbody>{invoice_rows}</tbody></table></div>
+    </div>"""
+
+
+def incoming_detail(connection, incoming_id: int) -> str:
+    item = connection.execute(
+        """
+        SELECT i.*, a.original_filename, a.id archive_id, COALESCE(s.company,'') supplier_company,
+               COALESCE(s.contact_name,'') supplier_contact, COALESCE(s.street,'') supplier_street,
+               COALESCE(s.postal_code,'') supplier_postal_code, COALESCE(s.city,'') supplier_city,
+               COALESCE(s.email,'') supplier_email
+        FROM incoming_invoices i
+        LEFT JOIN archive_files a ON a.id=i.archive_file_id
+        LEFT JOIN suppliers s ON s.id=i.supplier_id
+        WHERE i.id=?
+        """,
+        (incoming_id,),
+    ).fetchone()
+    if not item:
+        raise ValueError("Eingangsrechnung wurde nicht gefunden.")
+    category_options = "".join(
+        f'<option value="{h(category)}" {"selected" if category == item["eur_category"] else ""}>{h(category)}</option>'
+        for category in EXPENSE_CATEGORIES
+    )
+    gross = f"{item['gross_cents'] / 100:.2f}".replace(".", ",")
+    editable = item["status"] in ("draft", "booked")
+    readonly = "" if editable else "disabled"
+    delete = (
+        f'<form method="post" action="/incoming/{incoming_id}/delete" '
+        f'onsubmit="return confirm(\'Entwurf und zugehörige PDF endgültig löschen?\')">'
+        f'<button class="button danger">Entwurf samt PDF löschen</button></form>'
+        if item["status"] == "draft" else ""
+    )
+    cancel = (
+        f'<form method="post" action="/incoming/{incoming_id}/cancel" '
+        f'onsubmit="return confirm(\'Buchung stornieren? Der Beleg bleibt erhalten.\')">'
+        f'<button class="button danger">Buchung stornieren</button></form>'
+        if item["status"] in ("booked", "paid") else ""
+    )
+    return f"""
+    <div class="actions inline-actions">
+      <a class="button" target="_blank" href="/archive/{item['archive_id']}/pdf">Original-PDF öffnen</a>
+      {delete}{cancel}
+    </div>
+    <form class="card form" method="post" action="/incoming/{incoming_id}">
+      <h2>Lieferant</h2>
+      <div class="form-grid">
+        <label><span>Unternehmen *</span><input {readonly} required name="supplier_company" value="{h(item['supplier_company'])}"></label>
+        <label><span>Ansprechpartner</span><input {readonly} name="supplier_contact" value="{h(item['supplier_contact'])}"></label>
+        <label class="wide"><span>Straße</span><input {readonly} name="supplier_street" value="{h(item['supplier_street'])}"></label>
+        <label><span>PLZ</span><input {readonly} name="supplier_postal_code" value="{h(item['supplier_postal_code'])}"></label>
+        <label><span>Ort</span><input {readonly} name="supplier_city" value="{h(item['supplier_city'])}"></label>
+        <label><span>E-Mail</span><input {readonly} type="email" name="supplier_email" value="{h(item['supplier_email'])}"></label>
+      </div>
+      <h3>Buchungsdaten</h3>
+      <div class="form-grid">
+        <label><span>Rechnungsnummer</span><input {readonly} name="invoice_number" value="{h(item['invoice_number'])}"></label>
+        <label><span>Rechnungsdatum *</span><input {readonly} required type="date" name="invoice_date" value="{h(item['invoice_date'])}"></label>
+        <label><span>Fällig am</span><input {readonly} type="date" name="due_date" value="{h(item['due_date'])}"></label>
+        <label><span>Zahlungsdatum</span><input {readonly} type="date" name="payment_date" value="{h(item['payment_date'])}"></label>
+        <label><span>Bruttobetrag in EUR *</span><input {readonly} required name="gross_amount" value="{h(gross)}"></label>
+        <label><span>Betrieblicher Anteil in %</span><input {readonly} type="number" min="0" max="100" name="business_share_percent" value="{item['business_share_percent']}"></label>
+        <label class="wide"><span>EÜR-Kategorie *</span><select {readonly} name="eur_category">{category_options}</select></label>
+        <label class="wide"><span>Beschreibung</span><input {readonly} name="description" value="{h(item['description'])}"></label>
+        <label class="wide"><span>Notizen / Prüfvermerk</span><textarea {readonly} name="notes">{h(item['notes'])}</textarea></label>
+      </div>
+      <p class="notice">Bei Kleinunternehmern wird grundsätzlich der Bruttobetrag als Ausgabe
+      verwendet. Sonderfälle – insbesondere AfA, Bewirtung und private Anteile – müssen
+      steuerlich geprüft werden.</p>
+      {'<div class="form-actions"><button name="action" value="booked" class="button">Als gebucht speichern</button><button name="action" value="paid" class="button primary">Speichern und als bezahlt buchen</button></div>' if editable else ''}
+    </form>"""
+
+
+def euer_page(connection, year: int) -> str:
+    entries = euer_entries(connection, year)
+    summary = euer_summary(entries)
+    years = range(date.today().year, date.today().year - 8, -1)
+    options = "".join(
+        f'<option value="{value}" {"selected" if value == year else ""}>{value}</option>'
+        for value in years
+    )
+    category_rows = "".join(
+        f"<tr><td>{h(category)}</td><td class='money'>{money(amount)}</td></tr>"
+        for category, amount in summary["expense_categories"].items()
+    ) or '<tr><td colspan="2" class="empty">Keine bezahlten Ausgaben erfasst.</td></tr>'
+    entry_rows = "".join(
+        f"<tr><td>{german_date(item['date'])}</td><td>{h(item['kind'])}</td>"
+        f"<td>{h(item['number'] or '–')}</td><td>{h(item['party'] or '–')}</td>"
+        f"<td>{h(item['category'])}</td><td class='money'>{money(item['amount_cents'] if item['kind'] == 'Einnahme' else -item['amount_cents'])}</td></tr>"
+        for item in entries
+    ) or '<tr><td colspan="6" class="empty">Für dieses Jahr wurden noch keine Zahlungen erfasst.</td></tr>'
+    return f"""
+    <form class="filter-bar" method="get" action="/reports/euer">
+      <label><span>Auswertungsjahr</span><select name="year">{options}</select></label>
+      <button class="button">Anzeigen</button>
+      <a class="button" href="/reports/euer.csv?year={year}">CSV exportieren</a>
+      <a class="button primary" href="/reports/euer.pdf?year={year}">PDF-Arbeitsunterlage</a>
+    </form>
+    <div class="stats">
+      <article><span>Betriebseinnahmen</span><strong>{money(summary['income_cents'])}</strong></article>
+      <article><span>Betriebsausgaben</span><strong>{money(summary['expense_cents'])}</strong></article>
+      <article><span>Vorläufiger Überschuss</span><strong>{money(summary['profit_cents'])}</strong></article>
+    </div>
+    <div class="card"><div class="card-head"><h2>Ausgaben nach Kategorie</h2></div>
+      <div class="table-wrap"><table><thead><tr><th>Kategorie</th><th>Betrag</th></tr></thead><tbody>{category_rows}</tbody></table></div>
+    </div>
+    <div class="card"><div class="card-head"><h2>Zahlungsjournal</h2>
+      <p class="muted">Die Zuordnung erfolgt nach Zahlungsdatum (Zufluss/Abfluss).</p></div>
+      <div class="table-wrap"><table><thead><tr><th>Datum</th><th>Art</th><th>Beleg</th>
+      <th>Geschäftspartner</th><th>Kategorie</th><th>Betrag</th></tr></thead><tbody>{entry_rows}</tbody></table></div>
+    </div>
+    <div class="alert">Arbeitsunterlage – keine direkte ELSTER-Übermittlung. AfA, Einlagen,
+    Entnahmen und steuerlich beschränkte Ausgaben sind gesondert zu prüfen.</div>"""
 
 
 def settings_page(settings: dict[str, str]) -> str:
@@ -1278,6 +1513,29 @@ def application(environ, start_response):
                 document_id = int(path.split("/")[2])
                 number = finalize_document(connection, document_id)
                 return redirect(start_response, f"/document/{document_id}", f"{number} wurde fertiggestellt.")
+            elif method == "POST" and re.fullmatch(r"/document/\d+/delete", path):
+                document_id = int(path.split("/")[2])
+                document = fetch_document(connection, document_id)
+                if not document or document["status"] != "draft":
+                    raise ValueError("Nur Entwürfe dürfen endgültig gelöscht werden.")
+                Database.audit(connection, "document", document_id, "draft_deleted")
+                connection.execute("DELETE FROM documents WHERE id=?", (document_id,))
+                return redirect(
+                    start_response, f"/documents?type={document['document_type']}",
+                    "Entwurf wurde gelöscht.",
+                )
+            elif method == "POST" and re.fullmatch(r"/document/\d+/cancel", path):
+                document_id = int(path.split("/")[2])
+                document = fetch_document(connection, document_id)
+                if not document or document["status"] in ("draft", "cancelled", "paid"):
+                    raise ValueError("Dieses Dokument kann nicht storniert werden.")
+                now = Database.now()
+                connection.execute(
+                    "UPDATE documents SET status='cancelled', cancelled_at=?, updated_at=? WHERE id=?",
+                    (now, now, document_id),
+                )
+                Database.audit(connection, "document", document_id, "cancelled")
+                return redirect(start_response, f"/document/{document_id}", "Dokument wurde storniert und bleibt im Archiv erhalten.")
             elif method == "GET" and re.fullmatch(r"/document/\d+/pdf", path):
                 document_id = int(path.split("/")[2])
                 document = fetch_document(connection, document_id)
@@ -1288,9 +1546,19 @@ def application(environ, start_response):
                 )
             elif method == "POST" and re.fullmatch(r"/document/\d+/paid", path):
                 document_id = int(path.split("/")[2])
+                form = parse_form(environ)
+                payment_date = str(form.get("payment_date", "")).strip()
+                try:
+                    date.fromisoformat(payment_date)
+                except ValueError as exc:
+                    raise ValueError("Bitte ein gültiges Zahlungsdatum angeben.") from exc
                 now = Database.now()
-                connection.execute("UPDATE documents SET status='paid', paid_at=?, updated_at=? WHERE id=?", (now, now, document_id))
-                Database.audit(connection, "document", document_id, "paid")
+                paid_at = f"{payment_date}T12:00:00"
+                connection.execute(
+                    "UPDATE documents SET status='paid', paid_at=?, updated_at=? WHERE id=?",
+                    (paid_at, now, document_id),
+                )
+                Database.audit(connection, "document", document_id, "paid", payment_date)
                 return redirect(start_response, f"/document/{document_id}", "Zahlung wurde verbucht.")
             elif method == "POST" and re.fullmatch(r"/document/\d+/convert", path):
                 source_id = int(path.split("/")[2])
@@ -1326,43 +1594,81 @@ def application(environ, start_response):
                 )
             elif method == "POST" and path == "/archive/upload":
                 form = parse_form(environ)
-                upload = form.get("pdf")
-                if not upload or not isinstance(upload, UploadedFile):
-                    raise ValueError("Bitte eine PDF-Datei auswählen.")
-                raw = upload.data
-                if not raw.startswith(b"%PDF-"):
-                    raise ValueError("Die ausgewählte Datei ist keine gültige PDF-Datei.")
-                digest = hashlib.sha256(raw).hexdigest()
-                safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", Path(upload.filename).name)
-                stored_name = f"{datetime.now():%Y%m%d%H%M%S}-{digest[:12]}-{safe_name}"
-                target = DATA_DIR / "archive" / stored_name
-                existing = connection.execute(
-                    "SELECT id FROM archive_files WHERE sha256=? ORDER BY id LIMIT 1", (digest,)
-                ).fetchone()
-                if existing:
-                    return redirect(
-                        start_response, f"/archive/{existing['id']}",
-                        "Diese PDF-Datei ist bereits im Archiv.", "error",
+                uploads = uploaded_files(form.get("pdf"))
+                if not uploads:
+                    raise ValueError("Bitte mindestens eine PDF-Datei auswählen.")
+                if len(uploads) > 50:
+                    raise ValueError("Pro Import können höchstens 50 PDF-Dateien verarbeitet werden.")
+                if sum(len(upload.data) for upload in uploads) > 200 * 1024 * 1024:
+                    raise ValueError("Der gesamte Import darf höchstens 200 MB groß sein.")
+                direction = form.get("document_direction", "outgoing")
+                if direction not in ("outgoing", "incoming"):
+                    raise ValueError("Ungültige Belegart.")
+                created_ids, duplicates, invalid = [], 0, 0
+                for index, upload in enumerate(uploads):
+                    raw = upload.data
+                    if len(raw) > 20 * 1024 * 1024 or not raw.startswith(b"%PDF-"):
+                        invalid += 1
+                        continue
+                    digest = hashlib.sha256(raw).hexdigest()
+                    existing = connection.execute(
+                        "SELECT id FROM archive_files WHERE sha256=? ORDER BY id LIMIT 1", (digest,)
+                    ).fetchone()
+                    if existing:
+                        duplicates += 1
+                        continue
+                    safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", Path(upload.filename).name)
+                    stored_name = (
+                        f"{datetime.now():%Y%m%d%H%M%S%f}-{index:02d}-"
+                        f"{digest[:12]}-{safe_name}"
                     )
-                target.write_bytes(raw)
-                cursor = connection.execute(
-                    """
-                    INSERT INTO archive_files(original_filename, stored_filename, sha256, mime_type, file_size, uploaded_at)
-                    VALUES (?, ?, ?, 'application/pdf', ?, ?)
-                    """,
-                    (Path(upload.filename).name, stored_name, digest, len(raw), Database.now()),
+                    target = DATA_DIR / "archive" / stored_name
+                    target.write_bytes(raw)
+                    try:
+                        archive_id = connection.execute(
+                            """
+                            INSERT INTO archive_files(
+                                original_filename, stored_filename, sha256, mime_type,
+                                file_size, uploaded_at, document_direction
+                            ) VALUES (?, ?, ?, 'application/pdf', ?, ?, ?)
+                            """,
+                            (
+                                Path(upload.filename).name, stored_name, digest, len(raw),
+                                Database.now(), direction,
+                            ),
+                        ).lastrowid
+                    except Exception:
+                        target.unlink(missing_ok=True)
+                        raise
+                    result = analyze_invoice_pdf(raw, upload.filename, DB.settings())
+                    if len(uploads) == 1:
+                        if form.get("document_number"):
+                            result["invoice_number"] = str(form["document_number"]).strip()
+                        if form.get("issue_date"):
+                            result["issue_date"] = str(form["issue_date"])
+                        if form.get("amount"):
+                            result["amount_cents"] = cents(str(form["amount"]))
+                    update_archive_analysis(connection, archive_id, result)
+                    Database.audit(
+                        connection, "archive", archive_id, "uploaded_and_analyzed",
+                        f"{direction}: {upload.filename}",
+                    )
+                    created_ids.append(archive_id)
+                if not created_ids:
+                    raise ValueError(
+                        f"Keine neue PDF importiert ({duplicates} Duplikate, {invalid} ungültige/zu große Dateien)."
+                    )
+                if len(created_ids) == 1 and len(uploads) == 1:
+                    return redirect(
+                        start_response, f"/archive/{created_ids[0]}",
+                        "PDF wurde archiviert und analysiert.",
+                    )
+                return redirect(
+                    start_response, "/archive",
+                    f"Massenimport abgeschlossen: {len(created_ids)} importiert, "
+                    f"{duplicates} Duplikate übersprungen, {invalid} ungültig/zu groß.",
+                    "error" if invalid else "success",
                 )
-                archive_id = cursor.lastrowid
-                result = analyze_invoice_pdf(raw, upload.filename, DB.settings())
-                if form.get("document_number"):
-                    result["invoice_number"] = form["document_number"].strip()
-                if form.get("issue_date"):
-                    result["issue_date"] = form["issue_date"]
-                if form.get("amount"):
-                    result["amount_cents"] = cents(form["amount"])
-                update_archive_analysis(connection, archive_id, result)
-                Database.audit(connection, "archive", archive_id, "uploaded_and_analyzed", upload.filename)
-                return redirect(start_response, f"/archive/{archive_id}", "PDF wurde archiviert und analysiert.")
             elif method == "POST" and re.fullmatch(r"/archive/\d+/analyze", path):
                 archive_id = int(path.split("/")[2])
                 item = connection.execute(
@@ -1402,6 +1708,36 @@ def application(environ, start_response):
                 )
                 Database.audit(connection, "archive", archive_id, "metadata_corrected")
                 return redirect(start_response, f"/archive/{archive_id}", "Korrekturen wurden gespeichert.")
+            elif method == "POST" and re.fullmatch(r"/archive/\d+/payment", path):
+                archive_id = int(path.split("/")[2])
+                item = connection.execute(
+                    "SELECT document_direction, detected_amount_cents FROM archive_files WHERE id=?",
+                    (archive_id,),
+                ).fetchone()
+                if not item or item["document_direction"] != "outgoing":
+                    raise ValueError("Zahlungen können hier nur für Ausgangsrechnungen erfasst werden.")
+                form = parse_form(environ)
+                status = str(form.get("accounting_status", "unbooked"))
+                if status not in ("unbooked", "paid", "cancelled"):
+                    raise ValueError("Ungültiger Zahlungsstatus.")
+                payment_date = str(form.get("payment_date", "")).strip() or None
+                if status == "paid" and not payment_date:
+                    raise ValueError("Bitte das tatsächliche Zahlungsdatum angeben.")
+                if status == "paid" and item["detected_amount_cents"] is None:
+                    raise ValueError("Bitte zuerst den Rechnungsbetrag erfassen.")
+                now = Database.now()
+                connection.execute(
+                    """
+                    UPDATE archive_files SET accounting_status=?, payment_date=?,
+                    cancelled_at=? WHERE id=?
+                    """,
+                    (
+                        status, payment_date if status == "paid" else None,
+                        now if status == "cancelled" else None, archive_id,
+                    ),
+                )
+                Database.audit(connection, "archive", archive_id, f"accounting_{status}")
+                return redirect(start_response, f"/archive/{archive_id}", "Zahlungsstatus wurde gespeichert.")
             elif method == "POST" and re.fullmatch(r"/archive/\d+/customer", path):
                 archive_id = int(path.split("/")[2])
                 item = connection.execute(
@@ -1470,6 +1806,208 @@ def application(environ, start_response):
                 )
                 Database.audit(connection, "archive", archive_id, "customer_linked", str(customer_id))
                 return redirect(start_response, f"/archive/{archive_id}", message)
+            elif method == "POST" and re.fullmatch(r"/archive/\d+/delete", path):
+                archive_id = int(path.split("/")[2])
+                item = connection.execute(
+                    """
+                    SELECT a.*, i.id incoming_invoice_id
+                    FROM archive_files a
+                    LEFT JOIN incoming_invoices i ON i.archive_file_id=a.id
+                    WHERE a.id=?
+                    """,
+                    (archive_id,),
+                ).fetchone()
+                if not item:
+                    raise ValueError("Archivdatei wurde nicht gefunden.")
+                if (
+                    item["document_id"] or item["customer_id"] or item["incoming_invoice_id"]
+                    or item["accounting_status"] != "unbooked"
+                ):
+                    raise ValueError(
+                        "Der Beleg ist bereits zugeordnet oder gebucht und darf nicht gelöscht werden."
+                    )
+                target = DATA_DIR / "archive" / item["stored_filename"]
+                Database.audit(
+                    connection, "archive", archive_id, "unbooked_import_deleted",
+                    item["original_filename"],
+                )
+                connection.execute("DELETE FROM archive_files WHERE id=?", (archive_id,))
+                target.unlink(missing_ok=True)
+                return redirect(start_response, "/archive", "Fehlimport und PDF wurden gelöscht.")
+            elif method == "POST" and re.fullmatch(r"/archive/\d+/incoming", path):
+                archive_id = int(path.split("/")[2])
+                item = connection.execute(
+                    "SELECT * FROM archive_files WHERE id=?", (archive_id,)
+                ).fetchone()
+                if not item or item["document_direction"] != "incoming":
+                    raise ValueError("Der Beleg ist nicht als Eingangsrechnung importiert.")
+                existing = connection.execute(
+                    "SELECT id FROM incoming_invoices WHERE archive_file_id=?", (archive_id,)
+                ).fetchone()
+                if existing:
+                    return redirect(start_response, f"/incoming/{existing['id']}")
+                now = Database.now()
+                incoming_id = connection.execute(
+                    """
+                    INSERT INTO incoming_invoices(
+                        archive_file_id, invoice_number, invoice_date, gross_cents,
+                        deductible_cents, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        archive_id, item["detected_invoice_number"],
+                        item["detected_issue_date"] or date.today().isoformat(),
+                        item["detected_amount_cents"] or 0,
+                        item["detected_amount_cents"] or 0,
+                        now, now,
+                    ),
+                ).lastrowid
+                Database.audit(connection, "incoming_invoice", incoming_id, "draft_created_from_archive")
+                return redirect(
+                    start_response, f"/incoming/{incoming_id}",
+                    "Eingangsrechnung wurde als Entwurf angelegt. Bitte Daten prüfen.",
+                )
+            elif method == "GET" and path == "/incoming":
+                body, title, active = incoming_page(connection), "Eingangsrechnungen", "incoming"
+            elif method == "GET" and re.fullmatch(r"/incoming/\d+", path):
+                incoming_id = int(path.split("/")[2])
+                body, title, active = incoming_detail(connection, incoming_id), "Eingangsrechnung prüfen", "incoming"
+            elif method == "POST" and re.fullmatch(r"/incoming/\d+", path):
+                incoming_id = int(path.split("/")[2])
+                item = connection.execute(
+                    "SELECT * FROM incoming_invoices WHERE id=?", (incoming_id,)
+                ).fetchone()
+                if not item or item["status"] not in ("draft", "booked"):
+                    raise ValueError("Diese Eingangsrechnung kann nicht mehr geändert werden.")
+                form = parse_form(environ)
+                company = str(form.get("supplier_company", "")).strip()
+                if not company:
+                    raise ValueError("Bitte den Lieferanten angeben.")
+                supplier = connection.execute(
+                    "SELECT id FROM suppliers WHERE lower(trim(company))=lower(trim(?)) ORDER BY id LIMIT 1",
+                    (company,),
+                ).fetchone()
+                now = Database.now()
+                supplier_values = (
+                    company, str(form.get("supplier_contact", "")).strip(),
+                    str(form.get("supplier_street", "")).strip(),
+                    str(form.get("supplier_postal_code", "")).strip(),
+                    str(form.get("supplier_city", "")).strip(),
+                    str(form.get("supplier_email", "")).strip(), now,
+                )
+                if supplier:
+                    supplier_id = supplier["id"]
+                    connection.execute(
+                        """
+                        UPDATE suppliers SET company=?, contact_name=?, street=?, postal_code=?,
+                        city=?, email=?, updated_at=? WHERE id=?
+                        """,
+                        (*supplier_values, supplier_id),
+                    )
+                else:
+                    supplier_id = connection.execute(
+                        """
+                        INSERT INTO suppliers(
+                            company, contact_name, street, postal_code, city, email,
+                            created_at, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (*supplier_values[:-1], now, now),
+                    ).lastrowid
+                action = str(form.get("action", "booked"))
+                if action not in ("booked", "paid"):
+                    raise ValueError("Ungültiger Buchungsstatus.")
+                payment_date = str(form.get("payment_date", "")).strip() or None
+                if action == "paid" and not payment_date:
+                    raise ValueError("Für eine bezahlte Eingangsrechnung ist das Zahlungsdatum erforderlich.")
+                gross_cents = cents(str(form.get("gross_amount", "0")))
+                share = max(0, min(100, int(str(form.get("business_share_percent", "100")))))
+                deductible = int(
+                    (Decimal(gross_cents) * Decimal(share) / 100).quantize(
+                        Decimal("1"), rounding=ROUND_HALF_UP
+                    )
+                )
+                connection.execute(
+                    """
+                    UPDATE incoming_invoices SET supplier_id=?, invoice_number=?,
+                    invoice_date=?, due_date=?, payment_date=?, status=?, description=?,
+                    eur_category=?, gross_cents=?, business_share_percent=?,
+                    deductible_cents=?, notes=?, booked_at=COALESCE(booked_at,?),
+                    updated_at=? WHERE id=?
+                    """,
+                    (
+                        supplier_id, str(form.get("invoice_number", "")).strip(),
+                        str(form.get("invoice_date", "")), str(form.get("due_date", "")) or None,
+                        payment_date, action, str(form.get("description", "")).strip(),
+                        str(form.get("eur_category", "Sonstige Betriebsausgaben")),
+                        gross_cents, share, deductible, str(form.get("notes", "")).strip(),
+                        now, now, incoming_id,
+                    ),
+                )
+                connection.execute(
+                    "UPDATE archive_files SET accounting_status=? WHERE id=?",
+                    (action, item["archive_file_id"]),
+                )
+                Database.audit(connection, "incoming_invoice", incoming_id, action)
+                return redirect(start_response, f"/incoming/{incoming_id}", "Eingangsrechnung wurde gespeichert.")
+            elif method == "POST" and re.fullmatch(r"/incoming/\d+/delete", path):
+                incoming_id = int(path.split("/")[2])
+                item = connection.execute(
+                    """
+                    SELECT i.status, i.archive_file_id, a.stored_filename
+                    FROM incoming_invoices i JOIN archive_files a ON a.id=i.archive_file_id
+                    WHERE i.id=?
+                    """,
+                    (incoming_id,),
+                ).fetchone()
+                if not item or item["status"] != "draft":
+                    raise ValueError("Nur ein ungebuchter Entwurf darf gelöscht werden.")
+                target = DATA_DIR / "archive" / item["stored_filename"]
+                Database.audit(connection, "incoming_invoice", incoming_id, "draft_and_pdf_deleted")
+                connection.execute("DELETE FROM incoming_invoices WHERE id=?", (incoming_id,))
+                connection.execute("DELETE FROM archive_files WHERE id=?", (item["archive_file_id"],))
+                target.unlink(missing_ok=True)
+                return redirect(start_response, "/incoming", "Entwurf und PDF wurden gelöscht.")
+            elif method == "POST" and re.fullmatch(r"/incoming/\d+/cancel", path):
+                incoming_id = int(path.split("/")[2])
+                item = connection.execute(
+                    "SELECT status, archive_file_id FROM incoming_invoices WHERE id=?",
+                    (incoming_id,),
+                ).fetchone()
+                if not item or item["status"] not in ("booked", "paid"):
+                    raise ValueError("Diese Eingangsrechnung kann nicht storniert werden.")
+                now = Database.now()
+                connection.execute(
+                    "UPDATE incoming_invoices SET status='cancelled', cancelled_at=?, updated_at=? WHERE id=?",
+                    (now, now, incoming_id),
+                )
+                connection.execute(
+                    "UPDATE archive_files SET accounting_status='cancelled', cancelled_at=? WHERE id=?",
+                    (now, item["archive_file_id"]),
+                )
+                Database.audit(connection, "incoming_invoice", incoming_id, "cancelled")
+                return redirect(start_response, f"/incoming/{incoming_id}", "Buchung wurde storniert; der Beleg bleibt erhalten.")
+            elif method == "GET" and path == "/reports/euer":
+                try:
+                    year = int(query.get("year", [str(date.today().year)])[0])
+                except ValueError as exc:
+                    raise ValueError("Ungültiges Auswertungsjahr.") from exc
+                body, title, active = euer_page(connection, year), f"EÜR {year}", "reports"
+            elif method == "GET" and path == "/reports/euer.csv":
+                year = int(query.get("year", [str(date.today().year)])[0])
+                raw = create_euer_csv(euer_entries(connection, year))
+                return response(
+                    start_response, raw, content_type="text/csv; charset=utf-8",
+                    headers=[("Content-Disposition", f'attachment; filename="EÜR-{year}.csv"')],
+                )
+            elif method == "GET" and path == "/reports/euer.pdf":
+                year = int(query.get("year", [str(date.today().year)])[0])
+                target = DATA_DIR / "reports" / f"euer-{year}.pdf"
+                create_euer_pdf(target, year, euer_entries(connection, year), DB.settings())
+                return response(
+                    start_response, target.read_bytes(), content_type="application/pdf",
+                    headers=[("Content-Disposition", f'inline; filename="EÜR-{year}.pdf"')],
+                )
             elif method == "GET" and path == "/settings":
                 body, title, active = settings_page(DB.settings()), "Einstellungen", "settings"
             elif method == "POST" and path == "/settings":

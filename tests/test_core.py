@@ -13,6 +13,7 @@ APP_DIR = Path(__file__).resolve().parents[1] / "buchhaltung" / "app"
 sys.path.insert(0, str(APP_DIR))
 
 from db import Database
+from euer import create_euer_csv, create_euer_pdf, euer_entries, euer_summary
 from pdfgen import create_document_pdf
 from pdfimport import analyze_invoice_pdf
 
@@ -125,6 +126,83 @@ class CoreTests(unittest.TestCase):
             }
         self.assertIn("recurring_invoices", tables)
         self.assertIn("recurring_runs", tables)
+
+    def test_incoming_invoice_and_supplier_schema_exists(self):
+        with self.db.connect() as connection:
+            tables = {
+                row["name"]
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )
+            }
+            archive_columns = {
+                row["name"] for row in connection.execute("PRAGMA table_info(archive_files)")
+            }
+        self.assertIn("suppliers", tables)
+        self.assertIn("incoming_invoices", tables)
+        self.assertIn("document_direction", archive_columns)
+        self.assertIn("accounting_status", archive_columns)
+        self.assertIn("payment_date", archive_columns)
+
+    def test_euer_uses_payment_date_and_deductible_expense(self):
+        now = Database.now()
+        with self.db.connect() as connection:
+            customer_id = connection.execute(
+                """
+                INSERT INTO customers(customer_number, company, street, postal_code, city, created_at, updated_at)
+                VALUES ('1','Kunde GmbH','Weg 1','10115','Berlin',?,?)
+                """,
+                (now, now),
+            ).lastrowid
+            connection.execute(
+                """
+                INSERT INTO documents(
+                    document_type, document_number, status, customer_id, issue_date,
+                    total_cents, paid_at, created_at, updated_at
+                ) VALUES ('invoice','2025-12-0001','paid',?,'2025-12-20',12000,'2026-01-03T12:00:00+01:00',?,?)
+                """,
+                (customer_id, now, now),
+            )
+            supplier_id = connection.execute(
+                "INSERT INTO suppliers(company,created_at,updated_at) VALUES ('Hosting AG',?,?)",
+                (now, now),
+            ).lastrowid
+            connection.execute(
+                """
+                INSERT INTO incoming_invoices(
+                    supplier_id, invoice_number, invoice_date, payment_date, status,
+                    eur_category, gross_cents, business_share_percent, deductible_cents,
+                    created_at, updated_at
+                ) VALUES (?, 'R-1', '2025-12-29', '2026-01-05', 'paid',
+                          'Software und IT', 5000, 80, 4000, ?, ?)
+                """,
+                (supplier_id, now, now),
+            )
+            entries = euer_entries(connection, 2026)
+        summary = euer_summary(entries)
+        self.assertEqual(len(entries), 2)
+        self.assertEqual(summary["income_cents"], 12000)
+        self.assertEqual(summary["expense_cents"], 4000)
+        self.assertEqual(summary["profit_cents"], 8000)
+        csv_data = create_euer_csv(entries).decode("utf-8-sig")
+        self.assertIn("2026-01-03;Einnahme", csv_data)
+        self.assertIn("2026-01-05;Ausgabe", csv_data)
+
+    def test_euer_pdf_generation(self):
+        output = Path(self.temp.name) / "euer.pdf"
+        entries = [{
+            "kind": "Einnahme", "source": "Ausgangsrechnung", "source_id": 1,
+            "date": "2026-01-03", "number": "2025-12-0001",
+            "party": "Kunde GmbH", "category": "Betriebseinnahmen",
+            "amount_cents": 12000,
+        }, {
+            "kind": "Ausgabe", "source": "Eingangsrechnung", "source_id": 1,
+            "date": "2026-01-05", "number": "R-1", "party": "Hosting AG",
+            "category": "Software und IT", "amount_cents": 4000,
+        }]
+        create_euer_pdf(output, 2026, entries, {"company_name": "Musterbetrieb"})
+        self.assertTrue(output.read_bytes().startswith(b"%PDF"))
+        self.assertGreater(output.stat().st_size, 2_000)
 
     def test_generated_invoice_can_be_analyzed(self):
         settings = self.db.settings()

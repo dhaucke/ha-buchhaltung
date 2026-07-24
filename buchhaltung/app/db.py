@@ -91,6 +91,45 @@ CREATE TABLE IF NOT EXISTS archive_files (
     analysis_error TEXT NOT NULL DEFAULT ''
 );
 
+CREATE TABLE IF NOT EXISTS suppliers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    company TEXT NOT NULL,
+    contact_name TEXT NOT NULL DEFAULT '',
+    street TEXT NOT NULL DEFAULT '',
+    postal_code TEXT NOT NULL DEFAULT '',
+    city TEXT NOT NULL DEFAULT '',
+    country TEXT NOT NULL DEFAULT 'Deutschland',
+    email TEXT NOT NULL DEFAULT '',
+    tax_number TEXT NOT NULL DEFAULT '',
+    iban TEXT NOT NULL DEFAULT '',
+    notes TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS incoming_invoices (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    archive_file_id INTEGER UNIQUE REFERENCES archive_files(id),
+    supplier_id INTEGER REFERENCES suppliers(id),
+    invoice_number TEXT NOT NULL DEFAULT '',
+    invoice_date TEXT NOT NULL,
+    due_date TEXT,
+    payment_date TEXT,
+    status TEXT NOT NULL DEFAULT 'draft'
+        CHECK(status IN ('draft','booked','paid','cancelled')),
+    description TEXT NOT NULL DEFAULT '',
+    eur_category TEXT NOT NULL DEFAULT 'Sonstige Betriebsausgaben',
+    gross_cents INTEGER NOT NULL DEFAULT 0,
+    business_share_percent INTEGER NOT NULL DEFAULT 100
+        CHECK(business_share_percent BETWEEN 0 AND 100),
+    deductible_cents INTEGER NOT NULL DEFAULT 0,
+    notes TEXT NOT NULL DEFAULT '',
+    booked_at TEXT,
+    cancelled_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS recurring_invoices (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     customer_id INTEGER NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
@@ -144,6 +183,9 @@ CREATE INDEX IF NOT EXISTS idx_documents_customer ON documents(customer_id);
 CREATE INDEX IF NOT EXISTS idx_documents_type_status ON documents(document_type, status);
 CREATE INDEX IF NOT EXISTS idx_documents_issue_date ON documents(issue_date);
 CREATE INDEX IF NOT EXISTS idx_archive_customer ON archive_files(customer_id);
+CREATE INDEX IF NOT EXISTS idx_incoming_status ON incoming_invoices(status);
+CREATE INDEX IF NOT EXISTS idx_incoming_payment_date ON incoming_invoices(payment_date);
+CREATE INDEX IF NOT EXISTS idx_incoming_supplier ON incoming_invoices(supplier_id);
 CREATE INDEX IF NOT EXISTS idx_recurring_customer ON recurring_invoices(customer_id);
 CREATE INDEX IF NOT EXISTS idx_recurring_runs_status ON recurring_runs(status);
 """
@@ -185,6 +227,7 @@ class Database:
         self.data_dir.mkdir(parents=True, exist_ok=True)
         (self.data_dir / "documents").mkdir(exist_ok=True)
         (self.data_dir / "archive").mkdir(exist_ok=True)
+        (self.data_dir / "reports").mkdir(exist_ok=True)
         self.path = self.data_dir / "buchhaltung.sqlite3"
 
     @contextmanager
@@ -220,12 +263,21 @@ class Database:
                 "detected_city": "TEXT NOT NULL DEFAULT ''",
                 "analyzed_at": "TEXT",
                 "analysis_error": "TEXT NOT NULL DEFAULT ''",
+                "document_direction": "TEXT NOT NULL DEFAULT 'outgoing'",
+                "payment_date": "TEXT",
+                "eur_category": "TEXT NOT NULL DEFAULT 'Betriebseinnahmen'",
+                "accounting_status": "TEXT NOT NULL DEFAULT 'unbooked'",
+                "cancelled_at": "TEXT",
             }
             for column, definition in migrations.items():
                 if column not in existing:
                     connection.execute(
                         f"ALTER TABLE archive_files ADD COLUMN {column} {definition}"
                     )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_archive_direction "
+                "ON archive_files(document_direction)"
+            )
             connection.executemany(
                 "INSERT OR IGNORE INTO settings(key, value) VALUES (?, ?)",
                 DEFAULT_SETTINGS.items(),

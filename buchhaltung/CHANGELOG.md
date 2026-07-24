@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.4.0
+
+- Massenimport für bis zu 50 PDF-Belege pro Durchlauf
+- getrennte Kennzeichnung von Ausgangs- und Eingangsrechnungen
+- Lieferanten- und Eingangsrechnungsverwaltung mit Zahlungsdatum, EÜR-Kategorie
+  und betrieblichem Anteil
+- zahlungsbasierte EÜR-Arbeitsunterlage mit Jahresübersicht, PDF und CSV
+- historische Ausgangsrechnungen können mit ihrem Zahlungsdatum in die EÜR
+  aufgenommen werden
+- Fehlimporte und Entwürfe lassen sich endgültig löschen
+- gebuchte bzw. fertiggestellte Belege werden aus Gründen der Nachvollziehbarkeit
+  nur storniert und bleiben erhalten
+- frei wählbares Zahlungsdatum beim Buchen einer Ausgangsrechnung
+
 ## 0.3.0
 
 - neutraler Ersteinrichtungs-Assistent ohne fest eingebaute Firmendaten

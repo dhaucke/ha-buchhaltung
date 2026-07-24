@@ -1,6 +1,6 @@
 name: "Buchhaltung"
-description: "Lokale Angebote, Auftragsbestätigungen, Rechnungen und Dauerrechnungen"
-version: "0.3.0"
+description: "Lokale Ausgangs- und Eingangsrechnungen mit EÜR-Auswertung"
+version: "0.4.0"
 slug: "buchhaltung"
 url: "https://github.com/dhaucke/ha-buchhaltung"
 init: false

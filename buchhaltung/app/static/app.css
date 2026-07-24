@@ -46,6 +46,8 @@ main { margin-left: 245px; min-height: 100vh; }
 .actions { display: flex; justify-content: flex-end; gap: 10px; margin-bottom: 18px; }
 .inline-actions { flex-wrap: wrap; }
 .inline-actions form { margin: 0; }
+.payment-action { display: flex; gap: 7px; }
+.payment-action input { width: 155px; }
 .button {
   display: inline-flex; align-items: center; justify-content: center; min-height: 40px;
   border: 1px solid #b8c7da; border-radius: 8px; padding: 9px 15px;
@@ -54,6 +56,8 @@ main { margin-left: 245px; min-height: 100vh; }
 .button:hover { border-color: var(--navy); }
 .button.primary { background: var(--navy); border-color: var(--navy); color: white; }
 .button.primary:hover { background: var(--navy-dark); }
+.button.danger { color: var(--danger); border-color: #e5a9a4; background: #fff7f6; }
+.button.danger:hover { color: white; border-color: var(--danger); background: var(--danger); }
 .button.compact { min-height: 32px; padding: 6px 9px; font-size: 12px; white-space: nowrap; }
 .row-actions { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
 .row-actions form { margin: 0; }
@@ -102,6 +106,7 @@ textarea { min-height: 88px; resize: vertical; }
 .alert { border-radius: 9px; padding: 13px 15px; margin: 0 0 18px; border: 1px solid; }
 .alert.success { background: #ecf9f1; color: #146c43; border-color: #bfe4ce; }
 .alert.error { background: #fff1f0; color: #a11d15; border-color: #f3c3bf; }
+.alert:not(.success):not(.error) { background: #f8fafc; color: #475569; border-color: var(--line); }
 .empty-state { text-align: center; background: white; border: 1px solid var(--line); border-radius: 12px; padding: 55px 20px; }
 
 .document-sheet { padding: 32px; }
@@ -113,6 +118,12 @@ textarea { min-height: 88px; resize: vertical; }
 .grand-total { display: flex; justify-content: flex-end; gap: 35px; padding: 22px 16px; font-size: 18px; color: var(--navy); }
 .notice { margin: 24px 0 0; padding: 13px; background: #f8fafc; color: #475569; font-size: 13px; }
 .settings-status { margin-bottom: 20px; }
+.filter-bar {
+  display: flex; align-items: end; justify-content: flex-end; gap: 10px;
+  margin-bottom: 20px; padding: 16px; border: 1px solid var(--line);
+  border-radius: 12px; background: white;
+}
+.filter-bar label { min-width: 150px; }
 .customer-profile {
   padding: 22px; display: grid; grid-template-columns: repeat(5,minmax(0,1fr)); gap: 22px;
 }
@@ -196,4 +207,5 @@ textarea { min-height: 88px; resize: vertical; }
   .document-sheet { padding: 20px 14px; }
   .setup-main { padding: 28px 12px 50px; }
   .setup-submit { align-items: stretch; flex-direction: column; }
+  .filter-bar { align-items: stretch; flex-direction: column; }
 }

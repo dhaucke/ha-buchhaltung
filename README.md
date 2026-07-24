@@ -1,11 +1,12 @@
 # Buchhaltung
 
 Lokale, webbasierte Anwendung für Kunden, Angebote, Auftragsbestätigungen,
-Rechnungen und monatliche Dauerrechnungen. Sämtliche Firmendaten und das
+Ausgangs- und Eingangsrechnungen, monatliche Dauerrechnungen sowie eine
+EÜR-Arbeitsunterlage. Sämtliche Firmendaten und das
 Unternehmenslogo werden erst bei der Ersteinrichtung eingegeben und
 ausschließlich im persistenten Datenverzeichnis gespeichert.
 
-## Stand 0.3.0
+## Stand 0.4.0
 
 - neutraler Ersteinrichtungs-Assistent ohne fest eingebaute Firmendaten
 - eigenes Logo als PNG, JPG oder WebP
@@ -19,8 +20,15 @@ ausschließlich im persistenten Datenverzeichnis gespeichert.
 - PDF-Erzeugung mit eigener Absenderzeile und eigenem Logo
 - Status Entwurf, fertiggestellt, versendet und bezahlt
 - unveränderter Import alter PDF-Rechnungen mit SHA-256-Prüfsumme
+- Massenimport für bis zu 50 PDF-Belege (maximal 20 MB je Datei)
+- getrennte Verarbeitung von Ausgangs- und Eingangsrechnungen
 - Original-PDFs direkt im Archiv öffnen
 - Rechnungsnummer, Datum, Betrag, Kundennummer und Kundenanschrift auslesen
+- Lieferanten- und Eingangsrechnungsverwaltung
+- EÜR-Kategorien, betrieblicher Anteil und frei wählbares Zahlungsdatum
+- EÜR-Jahresauswertung als Bildschirmansicht, PDF und CSV
+- Fehlimporte und ungebuchte Entwürfe endgültig löschen
+- Storno statt Löschung für gebuchte oder fertiggestellte Belege
 - monatliche Dauerrechnungen mit Schutz gegen doppelte Monatsläufe
 - optionale automatische PDF-Erzeugung und Versand über Microsoft Graph
 - SQLite-Datenbank, Audit-Protokoll und persistentes Datenverzeichnis
@@ -92,6 +100,22 @@ Tenant-ID, Client-ID und Absenderadresse werden im Assistenten oder später unte
 „Einstellungen“ eingetragen. Die E-Mail wird über Graph gesendet und in
 „Gesendete Elemente“ gespeichert.
 
+## EÜR und Beleglöschung
+
+Die Auswertung ordnet Einnahmen und Ausgaben dem erfassten Zahlungsdatum zu.
+Historische Ausgangsrechnungen werden im Archiv als bezahlt markiert;
+Eingangsrechnungen werden mit Lieferant, Kategorie, Betrag, betrieblichem Anteil
+und Zahlungsdatum gebucht.
+
+Der PDF- und CSV-Export ist eine Arbeitsunterlage, keine direkte
+ELSTER-Übermittlung. Sonderfälle wie die Zehn-Tage-Regel für regelmäßig
+wiederkehrende Zahlungen, AfA, Einlagen/Entnahmen, Bewirtungsanteile und private
+Nutzungsanteile müssen fachlich geprüft werden.
+
+Nur unzugeordnete Fehlimporte und Entwürfe können physisch gelöscht werden.
+Bereits gebuchte, versendete oder anderweitig steuerlich relevante Belege werden
+storniert und bleiben zusammen mit dem Audit-Eintrag erhalten.
+
 ## Datensicherung
 
 Das komplette `/data`-Verzeichnis sichern. Es enthält:
@@ -100,6 +124,7 @@ Das komplette `/data`-Verzeichnis sichern. Es enthält:
 - `company-logo.png`
 - erzeugte PDF-Dokumente
 - importierte Altbelege
+- erzeugte EÜR-Berichte
 - Graph-Zertifikatsdateien, falls dort abgelegt
 
 Private Schlüssel müssen in verschlüsselten Backups geschützt werden.
@@ -120,7 +145,6 @@ python3 -m unittest discover -s tests -v
 
 - mehrere Rechnungspositionen direkt in der Oberfläche
 - ZUGFeRD-/XRechnung-Ausgabe und Validierung
-- Storno- und Gutschriftenworkflow
+- erweiterter Gutschriftenworkflow
 - Zahlungserinnerungen
-- Backup-Export aus der Oberfläche
 - Einrichtungshilfe für Entra und Exchange Application RBAC
