@@ -2633,7 +2633,7 @@ def application(environ, start_response):
                         file_duplicates += 1
                         duplicate_names.append(Path(upload.filename).name)
                         continue
-                    result = analyze_invoice_pdf(raw, upload.filename, DB.settings())
+                    result = analyze_invoice_pdf(raw, upload.filename, DB.settings(), direction)
                     if len(uploads) == 1:
                         if form.get("document_number"):
                             result["invoice_number"] = str(form["document_number"]).strip()
@@ -2720,14 +2720,16 @@ def application(environ, start_response):
             elif method == "POST" and re.fullmatch(r"/archive/\d+/analyze", path):
                 archive_id = int(path.split("/")[2])
                 item = connection.execute(
-                    "SELECT original_filename, stored_filename FROM archive_files WHERE id=?",
+                    "SELECT original_filename, stored_filename, document_direction "
+                    "FROM archive_files WHERE id=?",
                     (archive_id,),
                 ).fetchone()
                 if not item:
                     raise ValueError("Archivdatei wurde nicht gefunden.")
                 target = DATA_DIR / "archive" / item["stored_filename"]
                 result = analyze_invoice_pdf(
-                    target.read_bytes(), item["original_filename"], DB.settings()
+                    target.read_bytes(), item["original_filename"], DB.settings(),
+                    item["document_direction"],
                 )
                 update_archive_analysis(connection, archive_id, result)
                 Database.audit(connection, "archive", archive_id, "reanalyzed")

@@ -9,15 +9,19 @@ import pdfplumber
 
 
 AMOUNT_PATTERN = re.compile(
-    r"(?:Rechnungsendbetrag|Rechnungsbetrag|Gesamtbetrag|Endbetrag)"
-    r"\s*:?\s*(?:EUR\s*)?([\d.]+,\d{2})",
+    r"(?<!\S)(?:Rechnungsendbetrag|Rechnungsbetrag|Gesamtbetrag|Endbetrag)"
+    r"\s*:?\s*(?:EUR\s*)?(-?[\d.]+,\d{2})",
     re.IGNORECASE,
 )
 NUMBER_PATTERN = re.compile(
-    r"(?:Rechnungs(?:nr\.?|nummer)|Rechnung\s*(?:Nr\.?)?)\s*:?\s*"
-    r"((?:19|20)\d{2}\s*-\s*\d{2}\s*-\s*\d{3,6})",
+    r"(?:Rechnungs?[\s-]?(?:nr\.?|nummer)|Dokumentnummer|Beleg(?:s)?nummer)"
+    r"\s*:?\s*([0-9][A-Za-z0-9./-]{1,29})",
     re.IGNORECASE,
 )
+STREET_SUFFIX_PATTERN = re.compile(
+    r"(straße|strasse|str\.?|weg|allee|platz|ring|gasse|damm)$", re.IGNORECASE
+)
+ADDRESS_WORD_X_TOLERANCE = 1.5
 FILENAME_NUMBER_PATTERN = re.compile(r"((?:19|20)\d{2}-\d{2}-\d{3,6})")
 DATE_PATTERN = re.compile(
     r"(?:Rechnungsdatum|Datum)\s*:?\s*(\d{2}\.\d{2}\.\d{4})",
@@ -41,9 +45,9 @@ def _money_cents(value: str) -> int:
     return int(round(float(value.replace(".", "").replace(",", ".")) * 100))
 
 
-def _group_left_address_lines(page) -> list[str]:
+def _group_left_words(page) -> list[list[str]]:
     words = [
-        word for word in page.extract_words()
+        word for word in page.extract_words(x_tolerance=ADDRESS_WORD_X_TOLERANCE)
         if word["x0"] < page.width * 0.55 and 50 < word["top"] < page.height * 0.31
     ]
     grouped: list[list[dict]] = []
@@ -53,9 +57,53 @@ def _group_left_address_lines(page) -> list[str]:
         else:
             grouped[-1].append(word)
     return [
-        " ".join(item["text"] for item in sorted(line, key=lambda item: item["x0"])).strip()
+        [item["text"] for item in sorted(line, key=lambda item: item["x0"])]
         for line in grouped
     ]
+
+
+def _group_left_address_lines(page) -> list[str]:
+    return [" ".join(tokens).strip() for tokens in _group_left_words(page)]
+
+
+def _split_company_and_street(tokens: list[str]) -> tuple[str, str]:
+    if tokens and re.match(r"^\d+[a-zA-Z]?\.?$", tokens[-1]):
+        split_at = len(tokens) - 1
+        while split_at > 0 and not STREET_SUFFIX_PATTERN.search(tokens[split_at - 1]):
+            split_at -= 1
+        if split_at > 0:
+            return " ".join(tokens[:split_at]), " ".join(tokens[split_at:])
+    return " ".join(tokens), ""
+
+
+def _extract_incoming_supplier(page) -> dict[str, str]:
+    lines = _group_left_words(page)
+    if not lines:
+        return {}
+    header = lines[0]
+    for index, token in enumerate(header):
+        if not re.fullmatch(r"\d{5}", token):
+            continue
+        city = " ".join(header[index + 1:])
+        if not city:
+            break
+        remainder = header[:index]
+        lower = [item.lower() for item in remainder]
+        if "postfach" in lower:
+            box_index = lower.index("postfach")
+            company = " ".join(remainder[:box_index])
+            street = " ".join(remainder[box_index:])
+        else:
+            company, street = _split_company_and_street(remainder)
+        if company:
+            return {
+                "customer_name": company,
+                "street": street,
+                "postal_code": token,
+                "city": city,
+            }
+        break
+    return {}
 
 
 def _extract_customer(
@@ -103,6 +151,7 @@ def analyze_invoice_pdf(
     raw: bytes,
     filename: str = "",
     sender: dict[str, str] | None = None,
+    direction: str = "outgoing",
 ) -> dict:
     result = {
         "text": "",
@@ -147,7 +196,9 @@ def analyze_invoice_pdf(
                 result["amount_cents"] = _money_cents(amount.group(1))
 
             if document.pages:
-                result.update(_extract_customer(document.pages[0], texts[0], sender))
+                page = document.pages[0]
+                supplier = _extract_incoming_supplier(page) if direction == "incoming" else None
+                result.update(supplier or _extract_customer(page, texts[0], sender))
     except Exception as exc:
         result["error"] = f"PDF konnte nicht analysiert werden: {exc}"
     return result
