@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.6.7
+
+- ZUGFeRD-Erzeugung für Rechnungen mit Leistungszeitraum (z. B.
+  Dauerrechnungen) schlug mit „ApplicableHeaderTradeDelivery … is not
+  nillable“ fehl; behoben, indem zusätzlich immer ein Lieferdatum (BT-72)
+  mitgeschickt wird
+
 ## 0.6.6
 
 - eine stornierte Monatsrechnung blockiert eine Dauerrechnung nicht mehr

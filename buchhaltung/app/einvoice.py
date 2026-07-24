@@ -132,11 +132,13 @@ def build_en16931_data(
     }
     if document.get("due_date") and document["document_type"] == "invoice":
         data["BT-9"] = _date(document["due_date"])
+    # Always set BT-72: if only BT-73/BT-74 (service period) are present,
+    # factur-x emits an empty ApplicableHeaderTradeDelivery as xsi:nil, which
+    # fails XSD validation because that element isn't declared nillable.
+    data["BT-72"] = _date(document["issue_date"])
     if document.get("service_start") and document.get("service_end"):
         data["BT-73"] = _date(document["service_start"])
         data["BT-74"] = _date(document["service_end"])
-    else:
-        data["BT-72"] = _date(document["issue_date"])
     if settings.get("iban"):
         data.update({
             "BT-81": "58",
