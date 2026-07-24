@@ -81,6 +81,20 @@ def _extract_incoming_supplier(page) -> dict[str, str]:
     if not lines:
         return {}
     header = lines[0]
+    # Some senders separate company/street/city with commas on one line
+    # (e.g. "Company GmbH, c/o Coworking Space 4, 50672 City") rather than
+    # plain whitespace columns; try that first since it's unambiguous
+    # when present.
+    segments = [segment.strip() for segment in " ".join(header).split(",") if segment.strip()]
+    if len(segments) >= 2:
+        postal = POSTAL_PATTERN.match(segments[-1])
+        if postal:
+            return {
+                "customer_name": segments[0],
+                "street": " ".join(segments[1:-1]),
+                "postal_code": postal.group(1),
+                "city": postal.group(2),
+            }
     for index, token in enumerate(header):
         if not re.fullmatch(r"\d{5}", token):
             continue

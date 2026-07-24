@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.6.1
+
+- Lieferantenerkennung bei Eingangsrechnungen unterstützt jetzt auch
+  kommagetrennte Kopfzeilen ("Firma, c/o Adresse, PLZ Ort"), nicht nur das
+  bisherige Postfach-Format – behebt falsche Erkennung nach einem
+  Adressumzug eines Lieferanten
+
 ## 0.6.0
 
 - ZUGFeRD-/Factur-X-Rechnungen werden zusätzlich zur XML-Schema-Prüfung
