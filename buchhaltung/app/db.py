@@ -46,6 +46,9 @@ CREATE TABLE IF NOT EXISTS documents (
     introduction TEXT NOT NULL DEFAULT '',
     notes TEXT NOT NULL DEFAULT '',
     source_document_id INTEGER REFERENCES documents(id),
+    credit_reason TEXT NOT NULL DEFAULT '',
+    settlement_type TEXT NOT NULL DEFAULT '',
+    settled_at TEXT,
     total_cents INTEGER NOT NULL DEFAULT 0,
     finalized_at TEXT,
     sent_at TEXT,
@@ -170,6 +173,30 @@ CREATE TABLE IF NOT EXISTS mail_log (
     sent_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS payment_reminders (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+    reminder_level INTEGER NOT NULL,
+    reminder_date TEXT NOT NULL,
+    recipient TEXT NOT NULL,
+    subject TEXT NOT NULL,
+    body_html TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'sent',
+    response_code TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    UNIQUE(document_id, reminder_level)
+);
+
+CREATE TABLE IF NOT EXISTS e_invoice_files (
+    document_id INTEGER PRIMARY KEY REFERENCES documents(id) ON DELETE CASCADE,
+    profile TEXT NOT NULL,
+    pdf_filename TEXT NOT NULL,
+    xml_filename TEXT NOT NULL,
+    xsd_valid INTEGER NOT NULL DEFAULT 0,
+    validation_message TEXT NOT NULL DEFAULT '',
+    generated_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS audit_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     entity_type TEXT NOT NULL,
@@ -188,6 +215,7 @@ CREATE INDEX IF NOT EXISTS idx_incoming_payment_date ON incoming_invoices(paymen
 CREATE INDEX IF NOT EXISTS idx_incoming_supplier ON incoming_invoices(supplier_id);
 CREATE INDEX IF NOT EXISTS idx_recurring_customer ON recurring_invoices(customer_id);
 CREATE INDEX IF NOT EXISTS idx_recurring_runs_status ON recurring_runs(status);
+CREATE INDEX IF NOT EXISTS idx_payment_reminders_document ON payment_reminders(document_id);
 """
 
 
@@ -209,12 +237,15 @@ DEFAULT_SETTINGS = {
     "small_business_enabled": "1",
     "small_business_notice": "Steuerbefreiung für Kleinunternehmer gemäß § 19 UStG.",
     "payment_terms_days": "14",
+    "reminder_grace_days": "3",
+    "reminder_interval_days": "7",
     "invoice_counter": "0",
     "customer_counter": "0",
     "offer_counter": "0",
     "order_counter": "0",
     "graph_tenant_id": "",
     "graph_client_id": "",
+    "graph_service_principal_object_id": "",
     "graph_sender": "",
     "graph_certificate_path": "/data/graph-certificate.pem",
     "graph_private_key_path": "/data/graph-private-key.pem",
@@ -282,6 +313,19 @@ class Database:
                 "INSERT OR IGNORE INTO settings(key, value) VALUES (?, ?)",
                 DEFAULT_SETTINGS.items(),
             )
+            document_columns = {
+                row["name"] for row in connection.execute("PRAGMA table_info(documents)")
+            }
+            document_migrations = {
+                "credit_reason": "TEXT NOT NULL DEFAULT ''",
+                "settlement_type": "TEXT NOT NULL DEFAULT ''",
+                "settled_at": "TEXT",
+            }
+            for column, definition in document_migrations.items():
+                if column not in document_columns:
+                    connection.execute(
+                        f"ALTER TABLE documents ADD COLUMN {column} {definition}"
+                    )
 
     def settings(self) -> dict[str, str]:
         with self.connect() as connection:

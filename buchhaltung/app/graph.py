@@ -96,6 +96,10 @@ class GraphClient:
         with urllib.request.urlopen(request, timeout=20) as response:
             return json.loads(response.read())["access_token"]
 
+    def test_authentication(self) -> None:
+        """Validate certificate credentials without sending or reading mail."""
+        self._token()
+
     def send_pdf(
         self,
         recipient: str,
@@ -135,4 +139,3 @@ class GraphClient:
         except urllib.error.HTTPError as exc:
             details = exc.read().decode(errors="replace")
             raise RuntimeError(f"Graph-Fehler {exc.code}: {details[:500]}") from exc
-

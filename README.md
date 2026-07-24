@@ -6,7 +6,7 @@ EÜR-Arbeitsunterlage. Sämtliche Firmendaten und das
 Unternehmenslogo werden erst bei der Ersteinrichtung eingegeben und
 ausschließlich im persistenten Datenverzeichnis gespeichert.
 
-## Stand 0.4.1
+## Stand 0.5.0
 
 - neutraler Ersteinrichtungs-Assistent ohne fest eingebaute Firmendaten
 - eigenes Logo als PNG, JPG oder WebP
@@ -15,10 +15,15 @@ ausschließlich im persistenten Datenverzeichnis gespeichert.
 - frei wählbare Startwerte für Kunden-, Angebots-, Auftrags- und Rechnungsnummern
 - Kundenverwaltung mit Rechnungs-E-Mail
 - Angebote, Auftragsbestätigungen und Rechnungen
+- mehrere Positionen je Dokument mit Live-Summen und bearbeitbaren Entwürfen
 - Workflow Angebot → Auftrag → Rechnung
 - Rechnungsnummern nach dem Schema `YYYY-MM-NNNN`
 - PDF-Erzeugung mit eigener Absenderzeile und eigenem Logo
 - Status Entwurf, fertiggestellt, versendet und bezahlt
+- Teil- und Vollgutschriften mit Auszahlung oder Verrechnung
+- dreistufige Zahlungserinnerungen mit Vorschau vor dem Versand
+- ZUGFeRD-/Factur-X-Hybridrechnungen im Profil EN 16931 mit lokaler
+  XML-Schema-Validierung
 - unveränderter Import alter PDF-Rechnungen mit SHA-256-Prüfsumme
 - Massenimport für bis zu 50 PDF-Belege (maximal 20 MB je Datei)
 - getrennte Verarbeitung von Ausgangs- und Eingangsrechnungen
@@ -79,26 +84,42 @@ Anschließend ist die Anwendung unter `http://HOST:8099` erreichbar. Für extern
 Zugriff muss ein authentifizierender Reverse Proxy mit HTTPS vorgeschaltet
 werden. Port 8099 nicht ungefiltert ins Internet freigeben.
 
-## Microsoft Graph
+## Microsoft Graph und Exchange Application RBAC
 
 Benötigt werden:
 
 - Entra-App-Registrierung
-- Microsoft Graph Application Permission `Mail.Send`
-- Administratorzustimmung
 - Exchange Online Application RBAC, begrenzt auf das gewünschte Absenderpostfach
 - Zertifikat und privater Schlüssel im PEM-Format
 
-Dateien im persistenten Datenverzeichnis:
+Tenant-ID, Client-ID, Dienstprinzipal-Objekt-ID und Absenderadresse werden unter
+„Einstellungen“ eingetragen. Zertifikat und privater Schlüssel können dort
+direkt hochgeladen werden; ein SMB-Zugriff auf Home Assistant ist dafür nicht
+nötig. Die Microsoft-Einrichtung zeigt die passenden Exchange-Online-
+PowerShell-Befehle und bietet einen Verbindungstest ohne Mailversand.
 
-```text
-/data/graph-certificate.pem
-/data/graph-private-key.pem
-```
+Die enge Exchange-RBAC-Rolle `Application Mail.Send` ist der
+organisationsweiten Graph-Anwendungsberechtigung vorzuziehen. Eine zusätzlich
+in Entra erteilte, organisationsweite `Mail.Send`-Berechtigung wirkt additiv und
+würde die Beschränkung auf das eine Postfach ausweiten.
 
-Tenant-ID, Client-ID und Absenderadresse werden im Assistenten oder später unter
-„Einstellungen“ eingetragen. Die E-Mail wird über Graph gesendet und in
-„Gesendete Elemente“ gespeichert.
+## E-Rechnung
+
+Für fertiggestellte Rechnungen und Gutschriften kann ein ZUGFeRD-/Factur-X-PDF
+im Profil EN 16931 erzeugt werden. Die Anwendung:
+
+1. erzeugt den strukturierten CII-XML-Datensatz,
+2. validiert ihn lokal gegen das mitgelieferte XML-Schema,
+3. bettet ihn in das PDF ein und
+4. verwendet danach dieses Hybrid-PDF beim Mailversand.
+
+Die XRechnung mit vollständiger KoSIT-Geschäftsregelvalidierung ist noch nicht
+freigeschaltet. Eine bloß syntaktisch gültige XML-Datei wird bewusst nicht als
+„XRechnung-validiert“ bezeichnet.
+
+Kleinunternehmer sind aktuell von der Pflicht zur Ausstellung einer
+E-Rechnung ausgenommen, müssen E-Rechnungen aber empfangen können. Die
+ZUGFeRD-Ausgabe ist daher eine freiwillige, zukunftssichere Funktion.
 
 ## EÜR und Beleglöschung
 
@@ -143,8 +164,6 @@ python3 -m unittest discover -s tests -v
 
 ## Noch vorgesehen
 
-- mehrere Rechnungspositionen direkt in der Oberfläche
-- ZUGFeRD-/XRechnung-Ausgabe und Validierung
-- erweiterter Gutschriftenworkflow
-- Zahlungserinnerungen
-- Einrichtungshilfe für Entra und Exchange Application RBAC
+- XRechnung-Ausgabe mit offizieller KoSIT-Geschäftsregelvalidierung
+- Import und Visualisierung eingehender strukturierter E-Rechnungen
+- automatische, optional aktivierbare Erinnerungsläufe

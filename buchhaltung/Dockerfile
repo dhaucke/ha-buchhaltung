@@ -23,6 +23,7 @@ RUN apk add --no-cache \
       zlib-dev \
     && pip install --no-cache-dir \
       cryptography==45.0.7 \
+      factur-x==6.6 \
       pillow==11.3.0 \
       pdfplumber==0.11.7 \
       reportlab==4.4.3 \

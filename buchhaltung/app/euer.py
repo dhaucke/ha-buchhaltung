@@ -61,6 +61,28 @@ def euer_entries(connection, year: int) -> list[dict]:
 
     for row in connection.execute(
         """
+        SELECT d.id, d.document_number number, d.paid_at payment_timestamp,
+               d.total_cents amount_cents, c.company party
+        FROM documents d JOIN customers c ON c.id=d.customer_id
+        WHERE d.document_type='credit' AND d.status='refunded'
+          AND substr(d.paid_at,1,10) BETWEEN ? AND ?
+        ORDER BY d.paid_at, d.id
+        """,
+        (start, end),
+    ):
+        result.append({
+            "kind": "Einnahme",
+            "source": "Ausgezahlte Gutschrift",
+            "source_id": row["id"],
+            "date": row["payment_timestamp"][:10],
+            "number": row["number"] or "",
+            "party": row["party"],
+            "category": "Einnahmenkorrektur",
+            "amount_cents": -row["amount_cents"],
+        })
+
+    for row in connection.execute(
+        """
         SELECT id, detected_invoice_number number, payment_date,
                detected_amount_cents amount_cents, detected_customer_name party
         FROM archive_files

@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.5.0
+
+- beliebig viele Positionen in Angeboten, Aufträgen, Rechnungen und
+  Gutschriften direkt in der Oberfläche
+- Entwürfe inklusive aller Positionen nachträglich bearbeiten
+- Live-Berechnung der Positions- und Dokumentensummen
+- mehrzeilige Positionen werden vollständig in die PDF-Ausgabe übernommen
+- Gutschriften direkt aus einer Rechnung mit nachvollziehbarer Belegreferenz
+- Teil- und Vollgutschriften mit Schutz vor Überbuchung
+- getrennte Verbuchung als Auszahlung oder Verrechnung
+- ausgezahlte Gutschriften mindern die Einnahmen in der EÜR
+- dreistufige Zahlungserinnerungen mit Überfälligkeitsliste und Vorschau
+- ZUGFeRD-/Factur-X-Ausgabe im Profil EN 16931 für Rechnungen und Gutschriften
+- lokale XSD-Validierung sowie erneute Prüfung des eingebetteten XML
+- ZUGFeRD-PDFs werden nach ihrer Erzeugung automatisch beim Mailversand verwendet
+- geführte Entra-/Exchange-Application-RBAC-Einrichtung für ein Absenderpostfach
+- Zertifikat und privater Schlüssel können ohne Dateifreigabe in der Oberfläche
+  hochgeladen und auf Zusammengehörigkeit geprüft werden
+- Zertifikatsanmeldung kann ohne Mailversand getestet werden
+
 ## 0.4.1
 
 - ungebuchte PDF-Fehlimporte können auch dann gelöscht werden, wenn bereits ein

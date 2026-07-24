@@ -6,13 +6,17 @@ import sys
 import tempfile
 import unittest
 from datetime import date
+from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
+
+import pdfplumber
 
 
 APP_DIR = Path(__file__).resolve().parents[1] / "buchhaltung" / "app"
 sys.path.insert(0, str(APP_DIR))
 
 from db import Database
+from einvoice import create_zugferd
 from euer import create_euer_csv, create_euer_pdf, euer_entries, euer_summary
 from pdfgen import create_document_pdf
 from pdfimport import analyze_invoice_pdf
@@ -106,6 +110,70 @@ class CoreTests(unittest.TestCase):
         self.assertTrue(output.read_bytes().startswith(b"%PDF"))
         self.assertGreater(output.stat().st_size, 2_500)
 
+    def test_pdf_generation_with_multiple_items(self):
+        settings = self.db.settings()
+        settings.update({
+            "company_name": "Musterbetrieb",
+            "owner_name": "Max Mustermann",
+            "street": "Beispielstraße 1",
+            "postal_code": "10117",
+            "city": "Berlin",
+            "email": "rechnung@example.invalid",
+        })
+        items = []
+        for position, (description, quantity, unit_price) in enumerate([
+            ("Webhosting", 1000, 6000),
+            ("Datensicherung", 2500, 2000),
+            ("Domainregistrierung", 1000, 1500),
+        ], start=1):
+            total = int(
+                (Decimal(quantity) / 1000 * unit_price).quantize(
+                    Decimal("1"), rounding=ROUND_HALF_UP
+                )
+            )
+            items.append({
+                "position": position,
+                "category": "IT-Dienstleistung",
+                "description": description,
+                "quantity_milli": quantity,
+                "unit": "pauschal" if quantity == 1000 else "Stunde",
+                "unit_price_cents": unit_price,
+                "total_cents": total,
+                "service_period": "Juli 2026",
+            })
+        total_cents = sum(item["total_cents"] for item in items)
+        output = Path(self.temp.name) / "multiple-items.pdf"
+        create_document_pdf(
+            output,
+            {
+                "document_type": "invoice",
+                "document_number": "2026-07-0133",
+                "issue_date": "2026-07-23",
+                "due_date": "2026-08-06",
+                "title": "Mehrere Leistungen",
+                "introduction": "",
+                "notes": "",
+                "total_cents": total_cents,
+            },
+            {
+                "customer_number": "1002",
+                "company": "Muster GmbH",
+                "contact_name": "",
+                "street": "Musterweg 1",
+                "postal_code": "12345",
+                "city": "Berlin",
+            },
+            items,
+            settings,
+            None,
+        )
+        with pdfplumber.open(output) as pdf:
+            text = "\n".join(page.extract_text() or "" for page in pdf.pages)
+        self.assertIn("Webhosting", text)
+        self.assertIn("Datensicherung", text)
+        self.assertIn("Domainregistrierung", text)
+        self.assertIn("125,00 €", text)
+
     def test_archive_schema_migration(self):
         with self.db.connect() as connection:
             columns = {
@@ -143,6 +211,23 @@ class CoreTests(unittest.TestCase):
         self.assertIn("document_direction", archive_columns)
         self.assertIn("accounting_status", archive_columns)
         self.assertIn("payment_date", archive_columns)
+
+    def test_credit_reminder_and_einvoice_schema_exists(self):
+        with self.db.connect() as connection:
+            tables = {
+                row["name"]
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )
+            }
+            document_columns = {
+                row["name"] for row in connection.execute("PRAGMA table_info(documents)")
+            }
+        self.assertIn("payment_reminders", tables)
+        self.assertIn("e_invoice_files", tables)
+        self.assertIn("credit_reason", document_columns)
+        self.assertIn("settlement_type", document_columns)
+        self.assertIn("settled_at", document_columns)
 
     def test_euer_uses_payment_date_and_deductible_expense(self):
         now = Database.now()
@@ -204,6 +289,31 @@ class CoreTests(unittest.TestCase):
         self.assertTrue(output.read_bytes().startswith(b"%PDF"))
         self.assertGreater(output.stat().st_size, 2_000)
 
+    def test_refunded_credit_reduces_cash_income(self):
+        now = Database.now()
+        with self.db.connect() as connection:
+            customer_id = connection.execute(
+                """
+                INSERT INTO customers(customer_number, company, street, postal_code, city, created_at, updated_at)
+                VALUES ('1','Kunde GmbH','Weg 1','10115','Berlin',?,?)
+                """,
+                (now, now),
+            ).lastrowid
+            connection.execute(
+                """
+                INSERT INTO documents(
+                    document_type, document_number, status, customer_id, issue_date,
+                    total_cents, paid_at, settlement_type, settled_at, created_at, updated_at
+                ) VALUES ('credit','GS-2026-01-0002','refunded',?,'2026-01-10',
+                          2000,'2026-01-12T12:00:00','refund','2026-01-12T12:00:00',?,?)
+                """,
+                (customer_id, now, now),
+            )
+            entries = euer_entries(connection, 2026)
+        self.assertEqual(entries[0]["source"], "Ausgezahlte Gutschrift")
+        self.assertEqual(entries[0]["amount_cents"], -2000)
+        self.assertEqual(euer_summary(entries)["income_cents"], -2000)
+
     def test_generated_invoice_can_be_analyzed(self):
         settings = self.db.settings()
         settings.update({
@@ -239,6 +349,61 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(result["amount_cents"], 6000)
         self.assertEqual(result["customer_name"], "Test GmbH")
         self.assertEqual(result["customer_number"], "1003")
+
+    def test_zugferd_generation_and_embedded_xml_validation(self):
+        try:
+            from facturx import get_xml_from_pdf, xml_check_xsd
+        except ImportError:
+            self.skipTest("factur-x ist in der lokalen Testumgebung nicht installiert")
+        settings = self.db.settings()
+        settings.update({
+            "company_name": "Musterbetrieb",
+            "owner_name": "Max Mustermann",
+            "street": "Beispielstraße 1",
+            "postal_code": "10117",
+            "city": "Berlin",
+            "country": "Deutschland",
+            "email": "rechnung@example.invalid",
+            "tax_number": "12/345/67890",
+            "iban": "DE02120300000000202051",
+        })
+        document = {
+            "document_type": "invoice", "document_number": "2026-07-0133",
+            "issue_date": "2026-07-23", "due_date": "2026-08-06",
+            "service_start": None, "service_end": None, "payment_terms_days": 14,
+            "title": "Hosting", "introduction": "", "notes": "",
+            "credit_reason": "", "total_cents": 11000,
+        }
+        customer = {
+            "customer_number": "1003", "company": "Test GmbH", "contact_name": "",
+            "street": "Testweg 1", "postal_code": "12345", "city": "Berlin",
+            "country": "Deutschland", "email": "kunde@example.invalid",
+            "buyer_reference": "",
+        }
+        items = [{
+            "position": 1, "category": "Hosting", "description": "Webserver",
+            "quantity_milli": 1000, "unit": "pauschal", "unit_price_cents": 6000,
+            "total_cents": 6000, "service_period": "Juli 2026",
+        }, {
+            "position": 2, "category": "Service", "description": "Datensicherung",
+            "quantity_milli": 2500, "unit": "Stunde", "unit_price_cents": 2000,
+            "total_cents": 5000, "service_period": "Juli 2026",
+        }]
+        regular = Path(self.temp.name) / "invoice.pdf"
+        output = Path(self.temp.name) / "invoice-zugferd.pdf"
+        xml_output = Path(self.temp.name) / "factur-x.xml"
+        create_document_pdf(regular, document, customer, items, settings, None)
+        result = create_zugferd(
+            regular, output, xml_output, document, customer, items, settings
+        )
+        embedded_name, embedded_xml = get_xml_from_pdf(
+            output.read_bytes(), check_xsd=True, check_schematron=False
+        )
+        self.assertEqual(embedded_name, "factur-x.xml")
+        self.assertTrue(
+            xml_check_xsd(embedded_xml, flavor="factur-x", level="en16931")
+        )
+        self.assertTrue(result["xsd_valid"])
 
 
 if __name__ == "__main__":

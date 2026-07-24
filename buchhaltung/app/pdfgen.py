@@ -293,7 +293,13 @@ def create_document_pdf(
 
     totals = Table(
         [
-            ["Rechnungsbetrag" if document["document_type"] == "invoice" else "Gesamtbetrag", money(document["total_cents"])],
+            [
+                {
+                    "invoice": "Rechnungsbetrag",
+                    "credit": "Gutschriftsbetrag",
+                }.get(document["document_type"], "Gesamtbetrag"),
+                money(document["total_cents"]),
+            ],
         ],
         colWidths=[45 * mm, 35 * mm],
         hAlign="RIGHT",
@@ -337,6 +343,23 @@ def create_document_pdf(
         story.append(Paragraph("Dieses Angebot ist 30 Tage ab Ausstellungsdatum gültig.", styles["Body"]))
     elif document["document_type"] == "order":
         story.append(Paragraph("Vielen Dank für Ihren Auftrag.", styles["Body"]))
+    elif document["document_type"] == "credit":
+        if document.get("source_document_id"):
+            story.append(
+                Paragraph(
+                    f"Diese Gutschrift bezieht sich auf Rechnung "
+                    f"<b>{h_xml(document.get('source_document_number', ''))}</b>.",
+                    styles["Body"],
+                )
+            )
+            story.append(Spacer(1, 3 * mm))
+        if document.get("credit_reason"):
+            story.append(
+                Paragraph(
+                    f"<b>Grund:</b> {h_xml(document['credit_reason'])}",
+                    styles["Body"],
+                )
+            )
 
     if document.get("notes"):
         story.extend([Spacer(1, 4 * mm), Paragraph(document["notes"], styles["Small"])])

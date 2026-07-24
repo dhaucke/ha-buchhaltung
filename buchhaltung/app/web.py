@@ -26,6 +26,7 @@ from socketserver import ThreadingMixIn
 from PIL import Image as PillowImage, UnidentifiedImageError
 
 from db import Database
+from einvoice import create_zugferd
 from graph import GraphClient
 from euer import EXPENSE_CATEGORIES, create_euer_csv, create_euer_pdf, euer_entries, euer_summary
 from pdfgen import TYPE_LABELS, create_document_pdf, german_date, money
@@ -48,6 +49,9 @@ DOCUMENT_STATUS = {
     "sent": "Versendet",
     "accepted": "Bestätigt",
     "paid": "Bezahlt",
+    "settled": "Verrechnet",
+    "refunded": "Ausgezahlt",
+    "credited": "Vollständig gutgeschrieben",
     "cancelled": "Storniert",
 }
 
@@ -83,7 +87,11 @@ def parse_form(environ) -> dict:
                 result[name] = value
         return result
     raw = raw_bytes.decode("utf-8")
-    return {key: values[-1] for key, values in urllib.parse.parse_qs(raw, keep_blank_values=True).items()}
+    parsed = urllib.parse.parse_qs(raw, keep_blank_values=True)
+    return {
+        key: values if len(values) > 1 else values[-1]
+        for key, values in parsed.items()
+    }
 
 
 class UploadedFile:
@@ -96,6 +104,71 @@ class UploadedFile:
 def uploaded_files(value) -> list[UploadedFile]:
     values = value if isinstance(value, list) else [value]
     return [item for item in values if isinstance(item, UploadedFile) and item.filename]
+
+
+def form_values(form: dict, key: str) -> list[str]:
+    value = form.get(key, [])
+    if isinstance(value, list):
+        return [str(item) for item in value]
+    return [str(value)]
+
+
+def document_items_from_form(form: dict) -> list[dict]:
+    descriptions = form_values(form, "item_description")
+    categories = form_values(form, "item_category")
+    periods = form_values(form, "item_service_period")
+    quantities = form_values(form, "item_quantity")
+    units = form_values(form, "item_unit")
+    prices = form_values(form, "item_unit_price")
+    result = []
+    for index, description in enumerate(descriptions):
+        description = description.strip()
+        if not description:
+            continue
+        qty = quantity_milli(quantities[index] if index < len(quantities) else "1")
+        if qty <= 0:
+            raise ValueError(f"Die Menge in Position {index + 1} muss größer als 0 sein.")
+        unit_price = cents(prices[index] if index < len(prices) else "0")
+        if unit_price < 0:
+            raise ValueError(f"Der Einzelpreis in Position {index + 1} darf nicht negativ sein.")
+        total = int(
+            (Decimal(qty) / 1000 * unit_price).quantize(
+                Decimal("1"), rounding=ROUND_HALF_UP
+            )
+        )
+        result.append({
+            "position": len(result) + 1,
+            "category": categories[index].strip() if index < len(categories) else "",
+            "description": description,
+            "service_period": periods[index].strip() if index < len(periods) else "",
+            "quantity_milli": qty,
+            "unit": (units[index].strip() if index < len(units) else "") or "pauschal",
+            "unit_price_cents": unit_price,
+            "total_cents": total,
+        })
+    if not result:
+        raise ValueError("Bitte mindestens eine Rechnungsposition vollständig ausfüllen.")
+    return result
+
+
+def replace_document_items(connection, document_id: int, items: list[dict]) -> None:
+    connection.execute("DELETE FROM document_items WHERE document_id=?", (document_id,))
+    connection.executemany(
+        """
+        INSERT INTO document_items(
+            document_id, position, category, description, quantity_milli, unit,
+            unit_price_cents, total_cents, service_period
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        [
+            (
+                document_id, item["position"], item["category"], item["description"],
+                item["quantity_milli"], item["unit"], item["unit_price_cents"],
+                item["total_cents"], item["service_period"],
+            )
+            for item in items
+        ],
+    )
 
 
 def archive_can_be_deleted(item) -> bool:
@@ -149,6 +222,41 @@ def save_company_logo(upload) -> None:
         raise ValueError("Bitte ein gültiges PNG-, JPG- oder WebP-Logo hochladen.") from exc
 
 
+def save_graph_credentials(certificate, private_key) -> None:
+    uploads = [
+        (certificate, DATA_DIR / "graph-certificate.pem", "Zertifikat"),
+        (private_key, DATA_DIR / "graph-private-key.pem", "privater Schlüssel"),
+    ]
+    for upload, target, label in uploads:
+        if not upload:
+            continue
+        if not isinstance(upload, UploadedFile):
+            raise ValueError(f"{label} konnte nicht verarbeitet werden.")
+        if len(upload.data) > 128 * 1024:
+            raise ValueError(f"{label} ist ungewöhnlich groß.")
+        if b"-----BEGIN" not in upload.data:
+            raise ValueError(f"{label} muss im PEM-Format vorliegen.")
+        target.write_bytes(upload.data)
+        target.chmod(0o600)
+    if certificate or private_key:
+        cert_path = DATA_DIR / "graph-certificate.pem"
+        key_path = DATA_DIR / "graph-private-key.pem"
+        if cert_path.is_file() and key_path.is_file():
+            try:
+                from cryptography import x509
+                from cryptography.hazmat.primitives import serialization
+                cert = x509.load_pem_x509_certificate(cert_path.read_bytes())
+                key = serialization.load_pem_private_key(
+                    key_path.read_bytes(), password=None
+                )
+                if cert.public_key().public_numbers() != key.public_key().public_numbers():
+                    raise ValueError("Zertifikat und privater Schlüssel gehören nicht zusammen.")
+            except (ValueError, TypeError) as exc:
+                raise ValueError(
+                    f"Graph-Zertifikatsdateien sind ungültig: {exc}"
+                ) from exc
+
+
 def company_logo_data_uri() -> str:
     if not COMPANY_LOGO.is_file():
         return ""
@@ -198,6 +306,8 @@ def layout(title: str, body: str, active: str = "") -> str:
         ("/documents?type=offer", "offer", "Angebote"),
         ("/documents?type=order", "order", "Aufträge"),
         ("/documents?type=invoice", "invoice", "Rechnungen"),
+        ("/documents?type=credit", "credit", "Gutschriften"),
+        ("/reminders", "reminders", "Zahlungserinnerungen"),
         ("/incoming", "incoming", "Eingangsrechnungen"),
         ("/archive", "archive", "Archiv"),
         ("/reports/euer", "reports", "EÜR"),
@@ -375,26 +485,61 @@ def rows(connection, query: str, params=()):
 def fetch_document(connection, document_id: int):
     row = connection.execute(
         """
-        SELECT d.*, c.company, c.customer_number, c.email AS customer_email
-        FROM documents d JOIN customers c ON c.id=d.customer_id WHERE d.id=?
+        SELECT d.*, c.company, c.customer_number, c.email AS customer_email,
+               source.document_number AS source_document_number
+        FROM documents d
+        JOIN customers c ON c.id=d.customer_id
+        LEFT JOIN documents source ON source.id=d.source_document_id
+        WHERE d.id=?
         """,
         (document_id,),
     ).fetchone()
     return dict(row) if row else None
 
 
+def outstanding_cents(connection, document_id: int) -> int:
+    row = connection.execute(
+        """
+        SELECT max(0, d.total_cents - COALESCE((
+          SELECT sum(c.total_cents) FROM documents c
+          WHERE c.document_type='credit' AND c.source_document_id=d.id
+            AND c.status='settled'
+        ),0))
+        FROM documents d WHERE d.id=?
+        """,
+        (document_id,),
+    ).fetchone()
+    return int(row[0] or 0) if row else 0
+
+
 def dashboard(connection) -> str:
     stats = {
         "customers": connection.execute("SELECT count(*) FROM customers").fetchone()[0],
         "open": connection.execute(
-            "SELECT count(*) FROM documents WHERE document_type='invoice' AND status IN ('final','sent')"
+            """
+            SELECT count(*) FROM documents d
+            WHERE d.document_type='invoice' AND d.status IN ('final','sent')
+              AND d.total_cents > COALESCE((
+                SELECT sum(c.total_cents) FROM documents c
+                WHERE c.document_type='credit' AND c.source_document_id=d.id
+                  AND c.status='settled'
+              ),0)
+            """
         ).fetchone()[0],
         "paid": connection.execute(
             "SELECT COALESCE(sum(total_cents),0) FROM documents WHERE document_type='invoice' AND status='paid' AND substr(paid_at,1,4)=?",
             (str(date.today().year),),
         ).fetchone()[0],
         "outstanding": connection.execute(
-            "SELECT COALESCE(sum(total_cents),0) FROM documents WHERE document_type='invoice' AND status IN ('final','sent')"
+            """
+            SELECT COALESCE(sum(max(0, d.total_cents - COALESCE((
+              SELECT sum(c.total_cents) FROM documents c
+              WHERE c.document_type='credit' AND c.source_document_id=d.id
+                AND c.status='settled'
+            ),0))),0)
+            FROM documents d
+            WHERE d.document_type='invoice' AND d.status IN ('final','sent')
+            """
         ).fetchone()[0],
     }
     recent = rows(
@@ -567,56 +712,310 @@ def documents_page(connection, doc_type: str) -> str:
         <td><span class="status {h(d['status'])}">{h(DOCUMENT_STATUS.get(d['status'], d['status']))}</span></td></tr>"""
         for d in documents
     ) or f'<tr><td colspan="6" class="empty">Noch keine {h(TYPE_LABELS[doc_type])}-Dokumente vorhanden.</td></tr>'
+    create_action = (
+        '<div class="alert">Eine Gutschrift wird direkt aus der zugehörigen Rechnung '
+        'über „Gutschrift erstellen“ angelegt. Dadurch bleibt die Belegkette eindeutig.</div>'
+        if doc_type == "credit"
+        else f"""<div class="actions"><a class="button primary" href="/document/new?type={doc_type}">
+        {h(TYPE_LABELS[doc_type])} erstellen</a></div>"""
+    )
     return f"""
-    <div class="actions"><a class="button primary" href="/document/new?type={doc_type}">
-    {h(TYPE_LABELS[doc_type])} erstellen</a></div>
+    {create_action}
     <div class="card"><div class="table-wrap"><table><thead><tr><th>Nummer</th><th>Datum</th>
     <th>Kunde</th><th>Betreff</th><th>Betrag</th><th>Status</th></tr></thead>
     <tbody>{document_rows}</tbody></table></div></div>"""
 
 
+def reminders_page(connection) -> str:
+    today = date.today().isoformat()
+    invoices = rows(
+        connection,
+        """
+        SELECT d.*, c.company, c.email AS customer_email,
+          max(0, d.total_cents - COALESCE((
+            SELECT sum(cn.total_cents) FROM documents cn
+            WHERE cn.document_type='credit' AND cn.source_document_id=d.id
+              AND cn.status='settled'
+          ),0)) AS open_cents,
+          (SELECT max(reminder_level) FROM payment_reminders r
+           WHERE r.document_id=d.id AND r.status='sent') AS reminder_level,
+          (SELECT max(reminder_date) FROM payment_reminders r
+           WHERE r.document_id=d.id AND r.status='sent') AS last_reminder_date
+        FROM documents d
+        JOIN customers c ON c.id=d.customer_id
+        WHERE d.document_type='invoice'
+          AND d.status IN ('final','sent')
+          AND d.due_date < ?
+          AND d.total_cents > COALESCE((
+            SELECT sum(cn.total_cents) FROM documents cn
+            WHERE cn.document_type='credit' AND cn.source_document_id=d.id
+              AND cn.status='settled'
+          ),0)
+        ORDER BY d.due_date, d.id
+        """,
+        (today,),
+    )
+    invoice_rows = "".join(
+        f"""<tr><td><a href="/document/{item['id']}">{h(item['document_number'])}</a></td>
+        <td>{h(item['company'])}</td><td>{german_date(item['due_date'])}</td>
+        <td>{(date.today() - date.fromisoformat(item['due_date'])).days} Tage</td>
+        <td class="money">{money(item['open_cents'])}</td>
+        <td>{f"Stufe {item['reminder_level']} · {german_date(item['last_reminder_date'])}" if item['reminder_level'] else "Noch keine"}</td>
+        <td>{f'<a class="button compact primary" href="/document/{item["id"]}/reminder">Vorbereiten</a>' if item['customer_email'] else '<span class="status cancelled">E-Mail fehlt</span>'}</td></tr>"""
+        for item in invoices
+    ) or '<tr><td colspan="7" class="empty">Aktuell sind keine unbezahlten Rechnungen überfällig.</td></tr>'
+    return f"""
+    <div class="card"><div class="card-head"><h2>Überfällige Rechnungen</h2>
+    <p class="muted">Erinnerungen werden erst nach einer Vorschau ausdrücklich versendet.
+    Bereits bezahlte oder stornierte Rechnungen erscheinen hier nicht.</p></div>
+    <div class="table-wrap"><table><thead><tr><th>Rechnung</th><th>Kunde</th>
+    <th>Fällig seit</th><th>Überfällig</th><th>Betrag</th><th>Letzte Erinnerung</th><th></th>
+    </tr></thead><tbody>{invoice_rows}</tbody></table></div></div>"""
+
+
+def reminder_form(connection, document_id: int) -> str:
+    document = fetch_document(connection, document_id)
+    if (
+        not document or document["document_type"] != "invoice"
+        or document["status"] not in ("final", "sent")
+    ):
+        raise ValueError("Für diese Rechnung kann keine Zahlungserinnerung erstellt werden.")
+    if not document.get("due_date") or date.fromisoformat(document["due_date"]) >= date.today():
+        raise ValueError("Die Rechnung ist noch nicht überfällig.")
+    if not document["customer_email"]:
+        raise ValueError("Beim Kunden ist keine Rechnungs-E-Mail hinterlegt.")
+    previous = connection.execute(
+        "SELECT max(reminder_level) FROM payment_reminders WHERE document_id=? AND status='sent'",
+        (document_id,),
+    ).fetchone()[0] or 0
+    if previous >= 3:
+        raise ValueError("Für diese Rechnung wurden bereits drei Zahlungserinnerungen versendet.")
+    level = previous + 1
+    overdue_days = (date.today() - date.fromisoformat(document["due_date"])).days
+    open_amount = outstanding_cents(connection, document_id)
+    if open_amount <= 0:
+        raise ValueError("Für diese Rechnung besteht kein offener Betrag mehr.")
+    labels = {
+        1: "Freundliche Zahlungserinnerung",
+        2: "Zweite Zahlungserinnerung",
+        3: "Letzte Zahlungserinnerung",
+    }
+    subject = f"{labels[level]} zu Rechnung {document['document_number']}"
+    message = (
+        f"Guten Tag,\n\nbei der Durchsicht unserer Unterlagen ist uns aufgefallen, "
+        f"dass die Rechnung {document['document_number']} über {money(open_amount)} "
+        f"seit dem {german_date(document['due_date'])} fällig ist.\n\n"
+        "Falls Sie den Betrag inzwischen überwiesen haben, betrachten Sie diese Nachricht "
+        "bitte als gegenstandslos. Andernfalls bitten wir um zeitnahe Zahlung.\n\n"
+        "Mit freundlichen Grüßen"
+    )
+    return f"""
+    <form class="card form" method="post" action="/document/{document_id}/reminder">
+      <div class="alert"><b>{labels[level]}</b> · {overdue_days} Tage überfällig ·
+      Rechnung {h(document['document_number'])}</div>
+      <div class="form-grid">
+        <label><span>Empfänger</span><input readonly name="recipient" value="{h(document['customer_email'])}"></label>
+        <label><span>Erinnerungsstufe</span><input readonly value="{level}"></label>
+        <label class="wide"><span>Betreff *</span><input required name="subject" value="{h(subject)}"></label>
+        <label class="wide"><span>Nachricht *</span><textarea class="reminder-message" required name="message">{h(message)}</textarea></label>
+      </div>
+      <input type="hidden" name="reminder_level" value="{level}">
+      <div class="form-actions"><a class="button" href="/reminders">Abbrechen</a>
+      <button class="button primary">Zahlungserinnerung jetzt senden</button></div>
+    </form>"""
+
+
+def send_payment_reminder(connection, document_id: int, form: dict) -> None:
+    document = fetch_document(connection, document_id)
+    if (
+        not document or document["document_type"] != "invoice"
+        or document["status"] not in ("final", "sent")
+    ):
+        raise ValueError("Für diese Rechnung kann keine Zahlungserinnerung versendet werden.")
+    if not document["customer_email"]:
+        raise ValueError("Beim Kunden ist keine Rechnungs-E-Mail hinterlegt.")
+    level = int(form.get("reminder_level", "0"))
+    expected = (connection.execute(
+        "SELECT max(reminder_level) FROM payment_reminders WHERE document_id=? AND status='sent'",
+        (document_id,),
+    ).fetchone()[0] or 0) + 1
+    if expected > 3:
+        raise ValueError("Für diese Rechnung wurden bereits drei Zahlungserinnerungen versendet.")
+    if level != expected:
+        raise ValueError("Die Erinnerungsstufe ist nicht mehr aktuell. Bitte Vorschau neu öffnen.")
+    subject = str(form.get("subject", "")).strip()
+    message = str(form.get("message", "")).strip()
+    if not subject or not message:
+        raise ValueError("Betreff und Nachricht dürfen nicht leer sein.")
+    body_html = "<p>" + h(message).replace("\n\n", "</p><p>").replace("\n", "<br>") + "</p>"
+    pdf = preferred_document_pdf(connection, document_id)
+    status = GraphClient(DB.settings()).send_pdf(
+        document["customer_email"], subject, body_html, pdf.name, pdf.read_bytes()
+    )
+    now = Database.now()
+    connection.execute(
+        """
+        INSERT INTO payment_reminders(
+            document_id, reminder_level, reminder_date, recipient, subject,
+            body_html, status, response_code, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, 'sent', ?, ?)
+        """,
+        (
+            document_id, level, date.today().isoformat(), document["customer_email"],
+            subject, body_html, str(status), now,
+        ),
+    )
+    connection.execute(
+        "UPDATE documents SET status='sent', sent_at=COALESCE(sent_at,?), updated_at=? WHERE id=?",
+        (now, now, document_id),
+    )
+    Database.audit(connection, "document", document_id, "payment_reminder_sent", str(level))
+
+
 def document_form(
     connection, doc_type: str, source_id: int | None = None,
     preferred_customer_id: int | None = None,
+    document_id: int | None = None,
 ) -> str:
     customers = rows(connection, "SELECT * FROM customers ORDER BY company")
     if not customers:
         return '<div class="empty-state"><h2>Zuerst einen Kunden anlegen</h2><p>Für ein Dokument wird mindestens ein Kunde benötigt.</p><a class="button primary" href="/customer/new">Kunde anlegen</a></div>'
-    source = fetch_document(connection, source_id) if source_id else None
+    editing = fetch_document(connection, document_id) if document_id else None
+    if editing and editing["status"] != "draft":
+        raise ValueError("Nur Entwürfe können bearbeitet werden.")
+    source = editing or (fetch_document(connection, source_id) if source_id else None)
+    if doc_type == "credit" and not editing:
+        if (
+            not source or source["document_type"] != "invoice"
+            or source["status"] in ("draft", "cancelled")
+        ):
+            raise ValueError("Eine Gutschrift muss aus einer fertiggestellten Rechnung erstellt werden.")
     source_items = rows(
-        connection, "SELECT * FROM document_items WHERE document_id=? ORDER BY position", (source_id,)
+        connection, "SELECT * FROM document_items WHERE document_id=? ORDER BY position",
+        ((document_id or source_id),),
     ) if source else []
+    selected_customer_id = (
+        source["customer_id"] if source else preferred_customer_id
+    )
     customer_options = "".join(
-        f'<option value="{c["id"]}" {"selected" if (source and c["id"] == source["customer_id"]) or (not source and c["id"] == preferred_customer_id) else ""}>{h(c["company"])} ({h(c["customer_number"])})</option>'
+        f'<option value="{c["id"]}" {"selected" if c["id"] == selected_customer_id else ""}>'
+        f'{h(c["company"])} ({h(c["customer_number"])})</option>'
         for c in customers
     )
-    item = source_items[0] if source_items else {}
-    today = date.today().isoformat()
+    if not source_items:
+        source_items = [{
+            "category": "", "description": "", "service_period": "",
+            "quantity_milli": 1000, "unit": "pauschal", "unit_price_cents": 0,
+        }]
+    issue_date = editing["issue_date"] if editing else date.today().isoformat()
     title = source["title"] if source else ""
+    notes = editing["notes"] if editing else ""
+    credit_reason = editing["credit_reason"] if editing else ""
+    if doc_type == "credit" and source and not editing:
+        title = f"Gutschrift zu Rechnung {source['document_number'] or source['id']}"
+    service_start = editing["service_start"] if editing else ""
+    service_end = editing["service_end"] if editing else ""
+    action = f"/document/{document_id}/edit" if editing else "/document/new"
+    item_cards = "".join(
+        document_item_editor(item, index)
+        for index, item in enumerate(source_items, start=1)
+    )
     return f"""
-    <form class="card form" method="post" action="/document/new">
+    <form class="card form" method="post" action="{action}" id="document-form">
       <input type="hidden" name="document_type" value="{h(doc_type)}">
       <input type="hidden" name="source_document_id" value="{h(source_id or '')}">
       <div class="form-grid">
         <label><span>Kunde *</span><select required name="customer_id">{customer_options}</select></label>
-        <label><span>Dokumentdatum *</span><input required type="date" name="issue_date" value="{today}"></label>
+        <label><span>Dokumentdatum *</span><input required type="date" name="issue_date" value="{h(issue_date)}"></label>
         <label class="wide"><span>Betreff</span><input name="title" value="{h(title)}" placeholder="z. B. Hosting Services – Virtuelle Webserver"></label>
-        <label><span>Leistungsbeginn</span><input type="date" name="service_start"></label>
-        <label><span>Leistungsende</span><input type="date" name="service_end"></label>
+        <label><span>Leistungsbeginn</span><input type="date" name="service_start" value="{h(service_start)}"></label>
+        <label><span>Leistungsende</span><input type="date" name="service_end" value="{h(service_end)}"></label>
       </div>
-      <h3>Erste Position</h3>
-      <div class="form-grid">
-        <label><span>Kategorie</span><input name="category" value="{h(item.get('category', ''))}" placeholder="Hosting Services"></label>
-        <label class="wide"><span>Beschreibung *</span><input required name="description" value="{h(item.get('description', ''))}"></label>
-        <label><span>Zeitraum</span><input name="service_period" value="{h(item.get('service_period', ''))}" placeholder="01.07.2026–30.09.2026"></label>
-        <label><span>Menge</span><input name="quantity" value="1"></label>
-        <label><span>Einheit</span><input name="unit" value="{h(item.get('unit', 'pauschal'))}"></label>
-        <label><span>Einzelpreis in EUR *</span><input required name="unit_price" inputmode="decimal" value="{h(str(Decimal(item.get('unit_price_cents', 0))/100).replace('.', ',') if item else '')}"></label>
-        <label class="wide"><span>Hinweise</span><textarea name="notes"></textarea></label>
+      <div class="position-section">
+        <div class="split-head"><div><h3>Positionen</h3>
+        <p class="muted">Positionen können hinzugefügt, entfernt und vor dem
+        Fertigstellen jederzeit bearbeitet werden.</p></div>
+        <button class="button" type="button" id="add-position">Position hinzufügen</button></div>
+        <div id="position-list">{item_cards}</div>
+        <div class="position-total"><span>Dokumentsumme</span><strong id="document-total">0,00 €</strong></div>
       </div>
+      <div class="form-grid"><label class="wide"><span>Hinweise</span>
+      <textarea name="notes">{h(notes)}</textarea></label>
+      {f'''<label class="wide"><span>Grund der Gutschrift *</span>
+      <textarea required name="credit_reason" placeholder="z. B. Leistungsstornierung oder Preiskorrektur">{h(credit_reason)}</textarea></label>'''
+      if doc_type == "credit" else ''}</div>
       <div class="form-actions"><a class="button" href="/documents?type={h(doc_type)}">Abbrechen</a>
-      <button class="button primary">Als Entwurf speichern</button></div>
-    </form>"""
+      <button class="button primary">{'Änderungen speichern' if editing else 'Als Entwurf speichern'}</button></div>
+    </form>
+    <template id="position-template">{document_item_editor({}, 0)}</template>
+    <script>
+    (() => {{
+      const list = document.getElementById("position-list");
+      const template = document.getElementById("position-template");
+      const add = document.getElementById("add-position");
+      const parseMoney = value => {{
+        let normalized = String(value || "").trim().replace(/\\s/g, "");
+        if (normalized.includes(",")) normalized = normalized.replace(/\\./g, "").replace(",", ".");
+        return Number.parseFloat(normalized) || 0;
+      }};
+      const parseQuantity = value => Number.parseFloat(String(value || "").replace(",", ".")) || 0;
+      const moneyText = value => value.toLocaleString("de-DE", {{minimumFractionDigits: 2, maximumFractionDigits: 2}}) + " €";
+      const update = () => {{
+        let sum = 0;
+        const cards = [...list.querySelectorAll(".position-card")];
+        cards.forEach((card, index) => {{
+          card.querySelector(".position-number").textContent = `Position ${{index + 1}}`;
+          const subtotal = parseQuantity(card.querySelector("[name=item_quantity]").value)
+            * parseMoney(card.querySelector("[name=item_unit_price]").value);
+          card.querySelector(".position-subtotal").textContent = moneyText(subtotal);
+          card.querySelector(".remove-position").disabled = cards.length === 1;
+          sum += subtotal;
+        }});
+        document.getElementById("document-total").textContent = moneyText(sum);
+      }};
+      const wire = card => {{
+        card.querySelectorAll("input").forEach(input => input.addEventListener("input", update));
+        card.querySelector(".remove-position").addEventListener("click", () => {{
+          card.remove();
+          update();
+        }});
+      }};
+      [...list.querySelectorAll(".position-card")].forEach(wire);
+      add.addEventListener("click", () => {{
+        const fragment = template.content.cloneNode(true);
+        const card = fragment.querySelector(".position-card");
+        wire(card);
+        list.appendChild(fragment);
+        card.querySelector("[name=item_description]").focus();
+        update();
+      }});
+      update();
+    }})();
+    </script>"""
+
+
+def document_item_editor(item: dict, index: int) -> str:
+    quantity = Decimal(item.get("quantity_milli", 1000)) / 1000
+    price = Decimal(item.get("unit_price_cents", 0)) / 100
+    quantity_value = format(quantity.normalize(), "f").replace(".", ",")
+    price_value = (
+        format(price, ".2f").replace(".", ",")
+        if item.get("unit_price_cents") is not None else ""
+    )
+    return f"""
+    <article class="position-card">
+      <div class="position-card-head"><strong class="position-number">Position {index or ''}</strong>
+      <button class="button compact danger remove-position" type="button">Entfernen</button></div>
+      <div class="form-grid position-grid">
+        <label><span>Kategorie</span><input name="item_category" value="{h(item.get('category', ''))}" placeholder="z. B. Hosting"></label>
+        <label class="wide"><span>Beschreibung *</span><input required name="item_description" value="{h(item.get('description', ''))}"></label>
+        <label><span>Leistungszeitraum</span><input name="item_service_period" value="{h(item.get('service_period', ''))}" placeholder="01.07.2026–30.09.2026"></label>
+        <label><span>Menge *</span><input required name="item_quantity" inputmode="decimal" value="{h(quantity_value)}"></label>
+        <label><span>Einheit *</span><input required name="item_unit" value="{h(item.get('unit', 'pauschal'))}"></label>
+        <label><span>Einzelpreis in EUR *</span><input required name="item_unit_price" inputmode="decimal" value="{h(price_value)}"></label>
+      </div>
+      <div class="position-subtotal-row"><span>Positionssumme</span><strong class="position-subtotal">0,00 €</strong></div>
+    </article>"""
 
 
 def document_detail(connection, document_id: int) -> str:
@@ -624,6 +1023,9 @@ def document_detail(connection, document_id: int) -> str:
     if not document:
         return '<div class="alert error">Dokument nicht gefunden.</div>'
     items = rows(connection, "SELECT * FROM document_items WHERE document_id=? ORDER BY position", (document_id,))
+    electronic = connection.execute(
+        "SELECT * FROM e_invoice_files WHERE document_id=?", (document_id,)
+    ).fetchone()
     item_rows = "".join(
         f"<tr><td>{i['position']}</td><td>{h(i['description'])}</td><td>{h(i['service_period'])}</td>"
         f"<td class='money'>{money(i['unit_price_cents'])}</td><td class='money'>{money(i['total_cents'])}</td></tr>"
@@ -631,16 +1033,32 @@ def document_detail(connection, document_id: int) -> str:
     )
     actions = []
     if document["status"] == "draft":
+        actions.append(f'<a class="button" href="/document/{document_id}/edit">Entwurf bearbeiten</a>')
         actions.append(f'<form method="post" action="/document/{document_id}/finalize"><button class="button primary">Fertigstellen & PDF erzeugen</button></form>')
         actions.append(
             f'<form method="post" action="/document/{document_id}/delete" '
             f'onsubmit="return confirm(\'Diesen Entwurf endgültig löschen?\')">'
             f'<button class="button danger">Entwurf löschen</button></form>'
         )
-    if document["status"] in ("final", "sent"):
+    if document["status"] != "draft":
         actions.append(f'<a class="button" href="/document/{document_id}/pdf">PDF öffnen</a>')
-        if document["customer_email"]:
+        if document["status"] in ("final", "sent") and document["customer_email"]:
             actions.append(f'<form method="post" action="/document/{document_id}/send"><button class="button">Per E-Mail senden</button></form>')
+    if (
+        document["document_type"] in ("invoice", "credit")
+        and document["status"] not in ("draft", "cancelled")
+    ):
+        actions.append(
+            f'<form method="post" action="/document/{document_id}/zugferd">'
+            f'<button class="button">{"ZUGFeRD neu validieren" if electronic else "ZUGFeRD erzeugen"}</button></form>'
+        )
+        if electronic and electronic["xsd_valid"]:
+            actions.append(
+                f'<a class="button" href="/document/{document_id}/zugferd.pdf">ZUGFeRD-PDF</a>'
+            )
+            actions.append(
+                f'<a class="button" href="/document/{document_id}/zugferd.xml">XML öffnen</a>'
+            )
     if document["document_type"] == "offer" and document["status"] in ("final", "sent"):
         actions.append(f'<form method="post" action="/document/{document_id}/convert?to=order"><button class="button primary">Als Auftrag bestätigen</button></form>')
     if document["document_type"] == "order" and document["status"] in ("final", "sent", "accepted"):
@@ -651,7 +1069,25 @@ def document_detail(connection, document_id: int) -> str:
             f'<input aria-label="Zahlungsdatum" required type="date" name="payment_date" '
             f'value="{date.today().isoformat()}"><button class="button primary">Als bezahlt markieren</button></form>'
         )
-    if document["status"] not in ("draft", "cancelled", "paid"):
+        if document.get("due_date") and date.fromisoformat(document["due_date"]) < date.today():
+            actions.append(
+                f'<a class="button" href="/document/{document_id}/reminder">'
+                "Zahlungserinnerung</a>"
+            )
+    if document["document_type"] == "invoice" and document["status"] in ("final", "sent", "paid"):
+        actions.append(
+            f'<a class="button" href="/document/new?type=credit&source={document_id}">'
+            "Gutschrift erstellen</a>"
+        )
+    if document["document_type"] == "credit" and document["status"] in ("final", "sent"):
+        actions.append(
+            f'<form class="payment-action" method="post" action="/document/{document_id}/credit-settle">'
+            f'<input aria-label="Datum" required type="date" name="settlement_date" '
+            f'value="{date.today().isoformat()}">'
+            '<button class="button primary" name="settlement_type" value="refund">Auszahlung verbuchen</button>'
+            '<button class="button" name="settlement_type" value="offset">Mit Rechnung verrechnen</button></form>'
+        )
+    if document["status"] not in ("draft", "cancelled", "paid", "settled", "refunded"):
         actions.append(
             f'<form method="post" action="/document/{document_id}/cancel" '
             f'onsubmit="return confirm(\'Dokument stornieren? Der Beleg bleibt erhalten.\')">'
@@ -664,8 +1100,17 @@ def document_detail(connection, document_id: int) -> str:
         and settings.get("small_business_notice")
         else ""
     )
+    electronic_notice = ""
+    if electronic:
+        state = "success" if electronic["xsd_valid"] else "error"
+        electronic_notice = (
+            f'<div class="alert {state}"><b>{h(electronic["profile"])}</b> · '
+            f'{h(electronic["validation_message"])} · '
+            f'{h(electronic["generated_at"])}</div>'
+        )
     return f"""
     <div class="actions inline-actions">{''.join(actions)}</div>
+    {electronic_notice}
     <div class="document-sheet">
       <div class="document-head"><div><span>{h(TYPE_LABELS[document['document_type']])}</span>
       <h2>{h(document['document_number'] or 'Entwurf')}</h2></div>
@@ -673,6 +1118,8 @@ def document_detail(connection, document_id: int) -> str:
       <div class="document-meta"><div><span>Kunde</span><strong>{h(document['company'])}</strong></div>
       <div><span>Datum</span><strong>{german_date(document['issue_date'])}</strong></div>
       <div><span>Betreff</span><strong>{h(document['title'])}</strong></div></div>
+      {f'<p class="notice"><b>Grund:</b> {h(document["credit_reason"])}</p>'
+      if document["document_type"] == "credit" and document.get("credit_reason") else ""}
       <table><thead><tr><th>Pos.</th><th>Leistung</th><th>Zeitraum</th><th>Einzelpreis</th><th>Gesamt</th></tr></thead>
       <tbody>{item_rows}</tbody></table>
       <div class="grand-total"><span>Gesamtbetrag</span><strong>{money(document['total_cents'])}</strong></div>
@@ -698,6 +1145,30 @@ def finalize_document(connection, document_id: int):
     document = fetch_document(connection, document_id)
     if not document or document["status"] != "draft":
         raise ValueError("Nur Entwürfe können fertiggestellt werden.")
+    if document["document_type"] == "credit":
+        if not document.get("credit_reason"):
+            raise ValueError("Für eine Gutschrift muss ein Grund angegeben werden.")
+        source = fetch_document(connection, document.get("source_document_id"))
+        if (
+            not source or source["document_type"] != "invoice"
+            or source["status"] in ("draft", "cancelled")
+            or source["customer_id"] != document["customer_id"]
+        ):
+            raise ValueError("Die zugehörige Rechnung ist ungültig.")
+        previous_credits = connection.execute(
+            """
+            SELECT COALESCE(sum(total_cents),0) FROM documents
+            WHERE document_type='credit' AND source_document_id=?
+              AND id<>? AND status NOT IN ('draft','cancelled')
+            """,
+            (source["id"], document_id),
+        ).fetchone()[0]
+        remaining = source["total_cents"] - previous_credits
+        if document["total_cents"] > remaining:
+            raise ValueError(
+                f"Der Gutschriftsbetrag übersteigt den noch verfügbaren Betrag "
+                f"von {money(max(0, remaining))}."
+            )
     number = next_number(connection, document["document_type"], document["issue_date"])
     finalized_at = Database.now()
     connection.execute(
@@ -725,6 +1196,92 @@ def generate_pdf(connection, document_id: int) -> Path:
         COMPANY_LOGO if COMPANY_LOGO.is_file() else None,
     )
     return output
+
+
+def generate_zugferd(connection, document_id: int) -> dict:
+    document = fetch_document(connection, document_id)
+    if (
+        not document or document["document_type"] not in ("invoice", "credit")
+        or document["status"] == "draft"
+    ):
+        raise ValueError(
+            "ZUGFeRD kann nur für fertiggestellte Rechnungen und Gutschriften erzeugt werden."
+        )
+    customer = dict(connection.execute(
+        "SELECT * FROM customers WHERE id=?", (document["customer_id"],)
+    ).fetchone())
+    items = rows(
+        connection,
+        "SELECT * FROM document_items WHERE document_id=? ORDER BY position",
+        (document_id,),
+    )
+    regular_pdf = generate_pdf(connection, document_id)
+    safe_number = re.sub(r"[^A-Za-z0-9._-]", "_", document["document_number"])
+    pdf_filename = f"{safe_number}-zugferd.pdf"
+    xml_filename = f"{safe_number}-factur-x.xml"
+    output_pdf = DATA_DIR / "documents" / pdf_filename
+    output_xml = DATA_DIR / "documents" / xml_filename
+    try:
+        result = create_zugferd(
+            regular_pdf, output_pdf, output_xml, document, customer, items,
+            DB.settings(),
+        )
+    except Exception as exc:
+        now = Database.now()
+        connection.execute(
+            """
+            INSERT INTO e_invoice_files(
+                document_id, profile, pdf_filename, xml_filename, xsd_valid,
+                validation_message, generated_at
+            ) VALUES (?, 'ZUGFeRD / Factur-X EN 16931', ?, ?, 0, ?, ?)
+            ON CONFLICT(document_id) DO UPDATE SET
+              xsd_valid=0, validation_message=excluded.validation_message,
+              generated_at=excluded.generated_at
+            """,
+            (document_id, pdf_filename, xml_filename, str(exc)[:1000], now),
+        )
+        raise ValueError(f"ZUGFeRD-Validierung fehlgeschlagen: {exc}") from exc
+    now = Database.now()
+    connection.execute(
+        """
+        INSERT INTO e_invoice_files(
+            document_id, profile, pdf_filename, xml_filename, xsd_valid,
+            validation_message, generated_at
+        ) VALUES (?, ?, ?, ?, 1, 'XML-Schema erfolgreich validiert.', ?)
+        ON CONFLICT(document_id) DO UPDATE SET
+          profile=excluded.profile, pdf_filename=excluded.pdf_filename,
+          xml_filename=excluded.xml_filename, xsd_valid=1,
+          validation_message=excluded.validation_message,
+          generated_at=excluded.generated_at
+        """,
+        (document_id, result["profile"], pdf_filename, xml_filename, now),
+    )
+    Database.audit(
+        connection, "document", document_id, "zugferd_generated", result["profile"]
+    )
+    return result
+
+
+def electronic_invoice_path(connection, document_id: int, kind: str) -> Path:
+    item = connection.execute(
+        "SELECT * FROM e_invoice_files WHERE document_id=? AND xsd_valid=1",
+        (document_id,),
+    ).fetchone()
+    if not item:
+        raise ValueError("Für dieses Dokument wurde noch keine gültige E-Rechnung erzeugt.")
+    filename = item["pdf_filename"] if kind == "pdf" else item["xml_filename"]
+    root = (DATA_DIR / "documents").resolve()
+    target = (root / filename).resolve()
+    if target.parent != root or not target.is_file():
+        raise ValueError("Die erzeugte E-Rechnungsdatei wurde nicht gefunden.")
+    return target
+
+
+def preferred_document_pdf(connection, document_id: int) -> Path:
+    try:
+        return electronic_invoice_path(connection, document_id, "pdf")
+    except ValueError:
+        return generate_pdf(connection, document_id)
 
 
 MONTH_NAMES = [
@@ -771,7 +1328,7 @@ def send_document_email(connection, document_id: int):
         raise ValueError("Nur fertiggestellte Dokumente können versendet werden.")
     if not document["customer_email"]:
         raise ValueError("Beim Kunden ist keine Rechnungs-E-Mail hinterlegt.")
-    pdf = generate_pdf(connection, document_id)
+    pdf = preferred_document_pdf(connection, document_id)
     settings = DB.settings()
     company_name = settings.get("company_name", "")
     closing_name = settings.get("owner_name") or company_name
@@ -1228,6 +1785,7 @@ def settings_page(settings: dict[str, str]) -> str:
         ("website", "Website"), ("tax_number", "Steuernummer"), ("iban", "IBAN"), ("bic", "BIC"),
         ("bank_name", "Bank"), ("payment_terms_days", "Zahlungsziel in Tagen"),
         ("graph_tenant_id", "Microsoft Tenant-ID"), ("graph_client_id", "Microsoft Client-ID"),
+        ("graph_service_principal_object_id", "Dienstprinzipal-Objekt-ID"),
         ("graph_sender", "Graph-Absender"),
     ]
     inputs = "".join(
@@ -1253,9 +1811,54 @@ def settings_page(settings: dict[str, str]) -> str:
       <label class="check wide"><input type="checkbox" name="small_business_enabled" {checked}>
       <span>Kleinunternehmerregelung nach § 19 UStG verwenden</span></label>
       <label class="wide"><span>Kleinunternehmer-Hinweis</span>
-      <input name="small_business_notice" value="{h(settings.get('small_business_notice'))}"></label></div>
-      <div class="form-actions"><button class="button primary">Einstellungen speichern</button></div>
+      <input name="small_business_notice" value="{h(settings.get('small_business_notice'))}"></label>
+      <label><span>Öffentliches Zertifikat (PEM)</span>
+      <input type="file" name="graph_certificate" accept=".pem,.crt"></label>
+      <label><span>Privater Schlüssel (PEM)</span>
+      <input type="file" name="graph_private_key" accept=".pem,.key"></label></div>
+      <p class="notice">Der private Schlüssel wird nur im persistenten App-Datenverzeichnis
+      mit eingeschränkten Dateirechten gespeichert und gehört in ein verschlüsseltes Backup.</p>
+      <div class="form-actions"><a class="button" href="/settings/microsoft">Microsoft-Einrichtung öffnen</a>
+      <button class="button primary">Einstellungen speichern</button></div>
     </form>"""
+
+
+def microsoft_setup_page(settings: dict[str, str]) -> str:
+    client_id = settings.get("graph_client_id", "")
+    object_id = settings.get("graph_service_principal_object_id", "")
+    sender = settings.get("graph_sender", "")
+    scope_name = "Buchhaltung-Mailbox"
+    assignment_name = "Buchhaltung-Mail.Send"
+    complete = all((client_id, object_id, sender))
+    commands = f"""Connect-ExchangeOnline
+New-ServicePrincipal -AppId "{client_id or '<CLIENT-ID>'}" -ObjectId "{object_id or '<DIENSTPRINZIPAL-OBJEKT-ID>'}" -DisplayName "Buchhaltung"
+New-ManagementScope -Name "{scope_name}" -RecipientRestrictionFilter "PrimarySmtpAddress -eq '{sender or '<ABSENDER-POSTFACH>'}'"
+New-ManagementRoleAssignment -Name "{assignment_name}" -Role "Application Mail.Send" -App "{object_id or '<DIENSTPRINZIPAL-OBJEKT-ID>'}" -CustomResourceScope "{scope_name}"
+Test-ServicePrincipalAuthorization -Identity "{object_id or '<DIENSTPRINZIPAL-OBJEKT-ID>'}" -Resource "{sender or '<ABSENDER-POSTFACH>'}" | Format-Table"""
+    graph_status = GraphClient(settings).configured()
+    return f"""
+    <div class="card form">
+      <h2>Entra und Exchange Application RBAC</h2>
+      <p>Diese Variante beschränkt die Anwendung in Exchange auf genau das eingetragene
+      Absenderpostfach. Die Befehle müssen mit der Rolle Exchange-Administrator ausgeführt werden.</p>
+      <ol class="setup-guide">
+        <li><b>Entra-App registrieren.</b> Tenant-ID und Client-ID in den Einstellungen eintragen.</li>
+        <li><b>Zertifikat hochladen.</b> Den öffentlichen Anteil zusätzlich unter
+        „Zertifikate &amp; Geheimnisse“ in der App-Registrierung hinterlegen.</li>
+        <li><b>Dienstprinzipal-Objekt-ID ermitteln.</b> Dafür unter
+        „Unternehmensanwendungen“ die App öffnen; nicht die Objekt-ID der App-Registrierung verwenden.</li>
+        <li><b>Exchange RBAC ausführen.</b> Die folgenden Befehle in Exchange Online PowerShell verwenden.</li>
+      </ol>
+      <pre class="command-block">{h(commands)}</pre>
+      <div class="alert {'success' if complete and graph_status else ''}">
+      Stammdaten: {'vollständig' if complete else 'unvollständig'} ·
+      Zertifikatsdateien: {'vorhanden' if graph_status else 'unvollständig'}</div>
+      <p class="notice"><b>Wichtig:</b> Wenn „Application Mail.Send“ zusätzlich als
+      organisationsweite Graph-Anwendungsberechtigung mit Admin-Zustimmung in Entra vergeben
+      wird, wirkt diese additiv und hebt den engen Exchange-RBAC-Bereich praktisch auf.</p>
+      <div class="form-actions"><a class="button" href="/settings">Zurück zu Einstellungen</a>
+      {'<form method="post" action="/settings/microsoft/test"><button class="button primary">Zertifikatsanmeldung testen</button></form>' if graph_status else ''}</div>
+    </div>"""
 
 
 class ThreadingWSGIServer(ThreadingMixIn, WSGIServer):
@@ -1486,32 +2089,71 @@ def application(environ, start_response):
                 settings = DB.settings()
                 terms = int(settings["payment_terms_days"])
                 due_date = (date.fromisoformat(issue_date) + timedelta(days=terms)).isoformat() if doc_type == "invoice" else None
-                qty = quantity_milli(form.get("quantity", "1"))
-                unit_price = cents(form["unit_price"])
-                total = int((Decimal(qty) / 1000 * unit_price).quantize(Decimal("1")))
+                items = document_items_from_form(form)
+                total = sum(item["total_cents"] for item in items)
                 now = Database.now()
                 cursor = connection.execute(
                     """
                     INSERT INTO documents(document_type, status, customer_id, issue_date, service_start, service_end,
-                    due_date, payment_terms_days, title, notes, source_document_id, total_cents, created_at, updated_at)
-                    VALUES (?, 'draft', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    due_date, payment_terms_days, title, notes, source_document_id, credit_reason,
+                    total_cents, created_at, updated_at)
+                    VALUES (?, 'draft', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (doc_type, int(form["customer_id"]), issue_date, form.get("service_start") or None,
                      form.get("service_end") or None, due_date, terms, form.get("title", ""),
                      form.get("notes", ""), int(form["source_document_id"]) if form.get("source_document_id") else None,
-                     total, now, now),
+                     form.get("credit_reason", ""), total, now, now),
                 )
                 document_id = cursor.lastrowid
-                connection.execute(
-                    """
-                    INSERT INTO document_items(document_id, position, category, description, quantity_milli, unit,
-                    unit_price_cents, total_cents, service_period) VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (document_id, form.get("category", ""), form["description"], qty, form.get("unit", "pauschal"),
-                     unit_price, total, form.get("service_period", "")),
-                )
+                replace_document_items(connection, document_id, items)
                 Database.audit(connection, "document", document_id, "created", doc_type)
                 return redirect(start_response, f"/document/{document_id}", "Entwurf wurde gespeichert.")
+            elif method == "GET" and re.fullmatch(r"/document/\d+/edit", path):
+                document_id = int(path.split("/")[2])
+                document = fetch_document(connection, document_id)
+                if not document:
+                    raise ValueError("Dokument wurde nicht gefunden.")
+                body, title, active = (
+                    document_form(
+                        connection, document["document_type"], document_id=document_id
+                    ),
+                    f"{TYPE_LABELS[document['document_type']]} bearbeiten",
+                    document["document_type"],
+                )
+            elif method == "POST" and re.fullmatch(r"/document/\d+/edit", path):
+                document_id = int(path.split("/")[2])
+                document = fetch_document(connection, document_id)
+                if not document or document["status"] != "draft":
+                    raise ValueError("Nur Entwürfe können bearbeitet werden.")
+                form = parse_form(environ)
+                issue_date = form["issue_date"]
+                terms = int(DB.settings()["payment_terms_days"])
+                due_date = (
+                    date.fromisoformat(issue_date) + timedelta(days=terms)
+                ).isoformat() if document["document_type"] == "invoice" else None
+                items = document_items_from_form(form)
+                total = sum(item["total_cents"] for item in items)
+                now = Database.now()
+                connection.execute(
+                    """
+                    UPDATE documents SET customer_id=?, issue_date=?, service_start=?,
+                    service_end=?, due_date=?, payment_terms_days=?, title=?, notes=?,
+                    credit_reason=?, total_cents=?, updated_at=? WHERE id=?
+                    """,
+                    (
+                        int(form["customer_id"]), issue_date,
+                        form.get("service_start") or None,
+                        form.get("service_end") or None, due_date, terms,
+                        form.get("title", ""), form.get("notes", ""),
+                        form.get("credit_reason", ""), total, now, document_id,
+                    ),
+                )
+                replace_document_items(connection, document_id, items)
+                Database.audit(connection, "document", document_id, "updated")
+                return redirect(
+                    start_response, f"/document/{document_id}",
+                    "Entwurf und Positionen wurden gespeichert.",
+                )
             elif method == "GET" and re.fullmatch(r"/document/\d+", path):
                 document_id = int(path.rsplit("/", 1)[1])
                 document = fetch_document(connection, document_id)
@@ -1534,7 +2176,9 @@ def application(environ, start_response):
             elif method == "POST" and re.fullmatch(r"/document/\d+/cancel", path):
                 document_id = int(path.split("/")[2])
                 document = fetch_document(connection, document_id)
-                if not document or document["status"] in ("draft", "cancelled", "paid"):
+                if not document or document["status"] in (
+                    "draft", "cancelled", "paid", "settled", "refunded", "credited"
+                ):
                     raise ValueError("Dieses Dokument kann nicht storniert werden.")
                 now = Database.now()
                 connection.execute(
@@ -1551,8 +2195,36 @@ def application(environ, start_response):
                     start_response, pdf.read_bytes(), content_type="application/pdf",
                     headers=[("Content-Disposition", f'inline; filename="{document["document_number"]}.pdf"')],
                 )
+            elif method == "POST" and re.fullmatch(r"/document/\d+/zugferd", path):
+                document_id = int(path.split("/")[2])
+                generate_zugferd(connection, document_id)
+                return redirect(
+                    start_response, f"/document/{document_id}",
+                    "ZUGFeRD-PDF und XML wurden erzeugt und gegen das XML-Schema validiert.",
+                )
+            elif method == "GET" and re.fullmatch(r"/document/\d+/zugferd\.pdf", path):
+                document_id = int(path.split("/")[2])
+                target = electronic_invoice_path(connection, document_id, "pdf")
+                return response(
+                    start_response, target.read_bytes(), content_type="application/pdf",
+                    headers=[("Content-Disposition", f'inline; filename="{target.name}"')],
+                )
+            elif method == "GET" and re.fullmatch(r"/document/\d+/zugferd\.xml", path):
+                document_id = int(path.split("/")[2])
+                target = electronic_invoice_path(connection, document_id, "xml")
+                return response(
+                    start_response, target.read_bytes(),
+                    content_type="application/xml; charset=utf-8",
+                    headers=[("Content-Disposition", f'inline; filename="{target.name}"')],
+                )
             elif method == "POST" and re.fullmatch(r"/document/\d+/paid", path):
                 document_id = int(path.split("/")[2])
+                document = fetch_document(connection, document_id)
+                if (
+                    not document or document["document_type"] != "invoice"
+                    or document["status"] not in ("final", "sent")
+                ):
+                    raise ValueError("Diese Rechnung kann nicht als bezahlt verbucht werden.")
                 form = parse_form(environ)
                 payment_date = str(form.get("payment_date", "")).strip()
                 try:
@@ -1567,6 +2239,64 @@ def application(environ, start_response):
                 )
                 Database.audit(connection, "document", document_id, "paid", payment_date)
                 return redirect(start_response, f"/document/{document_id}", "Zahlung wurde verbucht.")
+            elif method == "POST" and re.fullmatch(r"/document/\d+/credit-settle", path):
+                document_id = int(path.split("/")[2])
+                document = fetch_document(connection, document_id)
+                if (
+                    not document or document["document_type"] != "credit"
+                    or document["status"] not in ("final", "sent")
+                ):
+                    raise ValueError("Diese Gutschrift kann nicht verbucht werden.")
+                form = parse_form(environ)
+                settlement_type = str(form.get("settlement_type", ""))
+                if settlement_type not in ("refund", "offset"):
+                    raise ValueError("Bitte eine gültige Verbuchungsart auswählen.")
+                settlement_date = str(form.get("settlement_date", "")).strip()
+                try:
+                    date.fromisoformat(settlement_date)
+                except ValueError as exc:
+                    raise ValueError("Bitte ein gültiges Datum angeben.") from exc
+                status = "refunded" if settlement_type == "refund" else "settled"
+                now = Database.now()
+                connection.execute(
+                    """
+                    UPDATE documents SET status=?, settlement_type=?, settled_at=?,
+                    paid_at=?, updated_at=? WHERE id=?
+                    """,
+                    (
+                        status, settlement_type, f"{settlement_date}T12:00:00",
+                        f"{settlement_date}T12:00:00" if settlement_type == "refund" else None,
+                        now, document_id,
+                    ),
+                )
+                if settlement_type == "offset" and document.get("source_document_id"):
+                    source = fetch_document(connection, document["source_document_id"])
+                    credited_total = connection.execute(
+                        """
+                        SELECT COALESCE(sum(total_cents),0) FROM documents
+                        WHERE document_type='credit' AND source_document_id=?
+                          AND status='settled'
+                        """,
+                        (source["id"],),
+                    ).fetchone()[0]
+                    if (
+                        source["status"] in ("final", "sent")
+                        and credited_total >= source["total_cents"]
+                    ):
+                        connection.execute(
+                            "UPDATE documents SET status='credited', updated_at=? WHERE id=?",
+                            (now, source["id"]),
+                        )
+                Database.audit(
+                    connection, "document", document_id, f"credit_{settlement_type}",
+                    settlement_date,
+                )
+                message = (
+                    "Auszahlung der Gutschrift wurde verbucht."
+                    if settlement_type == "refund"
+                    else "Gutschrift wurde mit der Rechnung verrechnet."
+                )
+                return redirect(start_response, f"/document/{document_id}", message)
             elif method == "POST" and re.fullmatch(r"/document/\d+/convert", path):
                 source_id = int(path.split("/")[2])
                 target = query.get("to", [""])[0]
@@ -1577,6 +2307,26 @@ def application(environ, start_response):
                 document_id = int(path.split("/")[2])
                 send_document_email(connection, document_id)
                 return redirect(start_response, f"/document/{document_id}", "E-Mail wurde über Microsoft Graph versendet.")
+            elif method == "GET" and path == "/reminders":
+                body, title, active = (
+                    reminders_page(connection),
+                    "Zahlungserinnerungen",
+                    "reminders",
+                )
+            elif method == "GET" and re.fullmatch(r"/document/\d+/reminder", path):
+                document_id = int(path.split("/")[2])
+                body, title, active = (
+                    reminder_form(connection, document_id),
+                    "Zahlungserinnerung prüfen",
+                    "reminders",
+                )
+            elif method == "POST" and re.fullmatch(r"/document/\d+/reminder", path):
+                document_id = int(path.split("/")[2])
+                send_payment_reminder(connection, document_id, parse_form(environ))
+                return redirect(
+                    start_response, f"/document/{document_id}",
+                    "Zahlungserinnerung wurde über Microsoft Graph versendet.",
+                )
             elif method == "GET" and path == "/archive":
                 body, title, active = archive_page(connection), "Dokumentenarchiv", "archive"
             elif method == "GET" and re.fullmatch(r"/archive/\d+", path):
@@ -2015,9 +2765,24 @@ def application(environ, start_response):
                 )
             elif method == "GET" and path == "/settings":
                 body, title, active = settings_page(DB.settings()), "Einstellungen", "settings"
+            elif method == "GET" and path == "/settings/microsoft":
+                body, title, active = (
+                    microsoft_setup_page(DB.settings()),
+                    "Microsoft-Einrichtung",
+                    "settings",
+                )
+            elif method == "POST" and path == "/settings/microsoft/test":
+                GraphClient(DB.settings()).test_authentication()
+                return redirect(
+                    start_response, "/settings/microsoft",
+                    "Zertifikatsanmeldung bei Microsoft war erfolgreich.",
+                )
             elif method == "POST" and path == "/settings":
                 form = parse_form(environ)
                 save_company_logo(form.get("logo"))
+                save_graph_credentials(
+                    form.get("graph_certificate"), form.get("graph_private_key")
+                )
                 allowed = set(DB.settings()) - {
                     "setup_complete", "invoice_counter", "customer_counter",
                     "offer_counter", "order_counter",
