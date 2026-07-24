@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.11
+
+- nach dem Speichern einer Eingangsrechnung geht es automatisch zum
+  nächsten offenen Beleg im Archiv weiter, solange noch welche vorhanden
+  sind – kein Umweg mehr über das Menü
+
 ## 0.5.10
 
 - Standard-EÜR-Kategorie für neu erfasste Eingangsrechnungen ist jetzt

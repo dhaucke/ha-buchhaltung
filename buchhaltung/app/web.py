@@ -3026,7 +3026,18 @@ def application(environ, start_response):
                     (action, item["archive_file_id"]),
                 )
                 Database.audit(connection, "incoming_invoice", incoming_id, action)
-                return redirect(start_response, f"/incoming/{incoming_id}", "Eingangsrechnung wurde gespeichert.")
+                next_id = Database.next_unreviewed_archive_id(
+                    connection, item["archive_file_id"], "incoming"
+                )
+                if next_id:
+                    return redirect(
+                        start_response, f"/archive/{next_id}",
+                        "Eingangsrechnung wurde gespeichert. Nächster offener Beleg wurde geladen.",
+                    )
+                return redirect(
+                    start_response, "/incoming",
+                    "Eingangsrechnung wurde gespeichert. Die Prüfliste ist vollständig abgearbeitet.",
+                )
             elif method == "POST" and re.fullmatch(r"/incoming/\d+/delete", path):
                 incoming_id = int(path.split("/")[2])
                 item = connection.execute(
