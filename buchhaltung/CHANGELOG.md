@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.7.0
+
+- Dauerrechnungen können jetzt nachträglich bearbeitet werden (Preis,
+  Menge, Beschreibung, Rechnungstag, Versandeinstellungen), nicht mehr
+  nur anlegen/pausieren/aktivieren
+- neues Versandformat wählbar – automatisch (ZUGFeRD bevorzugt), immer
+  ZUGFeRD-PDF oder immer normales PDF – sowohl für Dauerrechnungen als
+  auch beim manuellen Versand einer einzelnen Rechnung/Gutschrift
+- bei automatisch versendeten Dauerrechnungen wird ZUGFeRD bei Bedarf
+  jetzt selbstständig erzeugt, da dort niemand vorher manuell auf
+  „ZUGFeRD erzeugen“ klicken kann
+
 ## 0.6.9
 
 - Hauptmenü ist jetzt nach Verkauf, Einkauf und Auswertung gruppiert statt

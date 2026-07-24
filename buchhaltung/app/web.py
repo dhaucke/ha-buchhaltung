@@ -724,7 +724,8 @@ def customer_detail(connection, customer_id: int) -> str:
         <td>am {r['billing_day']}. des Monats</td>
         <td>{'Ja' if r['auto_send'] else 'Nein'}</td>
         <td><span class="status {'paid' if r['active'] else 'cancelled'}">{'Aktiv' if r['active'] else 'Pausiert'}</span></td>
-        <td><div class="row-actions"><form method="post" action="/recurring/{r['id']}/run">
+        <td><div class="row-actions"><a class="button compact" href="/recurring/{r['id']}/edit">Bearbeiten</a>
+        <form method="post" action="/recurring/{r['id']}/run">
         <button class="button compact">Jetzt erzeugen</button></form>
         <form method="post" action="/recurring/{r['id']}/toggle">
         <button class="button compact">{'Pausieren' if r['active'] else 'Aktivieren'}</button></form></div></td></tr>"""
@@ -1101,7 +1102,18 @@ def document_detail(connection, document_id: int) -> str:
     if document["status"] != "draft":
         actions.append(f'<a class="button" href="/document/{document_id}/pdf">PDF öffnen</a>')
         if document["status"] in ("final", "sent") and document["customer_email"]:
-            actions.append(f'<form method="post" action="/document/{document_id}/send"><button class="button">Per E-Mail senden</button></form>')
+            if electronic and electronic["xsd_valid"]:
+                actions.append(f"""
+                <form class="payment-action" method="post" action="/document/{document_id}/send">
+                  <select name="format">
+                    <option value="auto">Automatisch (ZUGFeRD bevorzugt)</option>
+                    <option value="zugferd">ZUGFeRD-PDF</option>
+                    <option value="pdf">Normales PDF</option>
+                  </select>
+                  <button class="button">Per E-Mail senden</button>
+                </form>""")
+            else:
+                actions.append(f'<form method="post" action="/document/{document_id}/send"><button class="button">Per E-Mail senden</button></form>')
     if (
         document["document_type"] in ("invoice", "credit")
         and document["status"] not in ("draft", "cancelled")
@@ -1348,13 +1360,21 @@ def preferred_document_pdf(connection, document_id: int) -> Path:
         return generate_pdf(connection, document_id)
 
 
+def resolve_document_pdf(connection, document_id: int, pdf_format: str = "auto") -> Path:
+    if pdf_format == "zugferd":
+        return electronic_invoice_path(connection, document_id, "pdf")
+    if pdf_format == "pdf":
+        return generate_pdf(connection, document_id)
+    return preferred_document_pdf(connection, document_id)
+
+
 MONTH_NAMES = [
     "", "Januar", "Februar", "März", "April", "Mai", "Juni",
     "Juli", "August", "September", "Oktober", "November", "Dezember",
 ]
 
 
-def recurring_form(connection, customer_id: int) -> str:
+def recurring_form(connection, customer_id: int, template=None) -> str:
     customer = connection.execute("SELECT * FROM customers WHERE id=?", (customer_id,)).fetchone()
     if not customer:
         raise ValueError("Kunde wurde nicht gefunden.")
@@ -1363,36 +1383,62 @@ def recurring_form(connection, customer_id: int) -> str:
         if customer["email"] else
         '<div class="alert error">Für automatischen Versand muss zuerst eine Rechnungs-E-Mail beim Kunden hinterlegt werden.</div>'
     )
+    editing = template is not None
+    action = f"/recurring/{template['id']}/edit" if editing else f"/customer/{customer_id}/recurring/new"
+    billing_day = template["billing_day"] if editing else 1
+    title = template["title"] if editing else ""
+    category = template["category"] if editing else ""
+    description = template["description"] if editing else ""
+    service_period_template = template["service_period_template"] if editing else "{monat} {jahr}"
+    quantity = (
+        f"{Decimal(template['quantity_milli']) / 1000:g}".replace(".", ",") if editing else "1"
+    )
+    unit = template["unit"] if editing else "pauschal"
+    unit_price = (
+        f"{Decimal(template['unit_price_cents']) / 100:.2f}".replace(".", ",") if editing else ""
+    )
+    auto_finalize_checked = "checked" if not editing or template["auto_finalize"] else ""
+    auto_send_checked = "checked" if editing and template["auto_send"] else ""
+    send_format = template["send_format"] if editing else "auto"
+    send_format_options = "".join(
+        f'<option value="{value}" {"selected" if value == send_format else ""}>{label}</option>'
+        for value, label in (
+            ("auto", "Automatisch (ZUGFeRD bevorzugt)"),
+            ("zugferd", "Immer ZUGFeRD-PDF"),
+            ("pdf", "Immer normales PDF"),
+        )
+    )
     return f"""
     {warning}
-    <form class="card form" method="post" action="/customer/{customer_id}/recurring/new">
-      <h2>Monatliche Rechnung für {h(customer['company'])}</h2>
+    <form class="card form" method="post" action="{action}">
+      <h2>{'Monatliche Rechnung bearbeiten' if editing else 'Monatliche Rechnung für ' + h(customer['company'])}</h2>
       <div class="form-grid">
-        <label><span>Rechnungstag (1–28)</span><input required type="number" min="1" max="28" name="billing_day" value="1"></label>
-        <label><span>Betreff</span><input name="title" placeholder="Hosting Services"></label>
-        <label><span>Kategorie</span><input name="category" placeholder="Hosting"></label>
-        <label class="wide"><span>Leistungsbeschreibung *</span><input required name="description" placeholder="Virtueller Webserver"></label>
-        <label class="wide"><span>Leistungszeitraum</span><input name="service_period_template" value="{{monat}} {{jahr}}">
+        <label><span>Rechnungstag (1–28)</span><input required type="number" min="1" max="28" name="billing_day" value="{billing_day}"></label>
+        <label><span>Betreff</span><input name="title" placeholder="Hosting Services" value="{h(title)}"></label>
+        <label><span>Kategorie</span><input name="category" placeholder="Hosting" value="{h(category)}"></label>
+        <label class="wide"><span>Leistungsbeschreibung *</span><input required name="description" placeholder="Virtueller Webserver" value="{h(description)}"></label>
+        <label class="wide"><span>Leistungszeitraum</span><input name="service_period_template" value="{h(service_period_template)}">
         <small class="muted">Platzhalter: {{monat}}, {{monat_nummer}} und {{jahr}}</small></label>
-        <label><span>Menge</span><input name="quantity" value="1"></label>
-        <label><span>Einheit</span><input name="unit" value="pauschal"></label>
-        <label><span>Einzelpreis in EUR *</span><input required name="unit_price" inputmode="decimal"></label>
-        <label class="check"><input type="checkbox" name="auto_finalize" checked><span>Automatisch fertigstellen und PDF erzeugen</span></label>
-        <label class="check"><input type="checkbox" name="auto_send" {'disabled' if not customer['email'] else ''}>
+        <label><span>Menge</span><input name="quantity" value="{h(quantity)}"></label>
+        <label><span>Einheit</span><input name="unit" value="{h(unit)}"></label>
+        <label><span>Einzelpreis in EUR *</span><input required name="unit_price" inputmode="decimal" value="{h(unit_price)}"></label>
+        <label class="check"><input type="checkbox" name="auto_finalize" {auto_finalize_checked}><span>Automatisch fertigstellen und PDF erzeugen</span></label>
+        <label class="check"><input type="checkbox" name="auto_send" {auto_send_checked} {'disabled' if not customer['email'] else ''}>
         <span>PDF automatisch an die Rechnungs-E-Mail versenden</span></label>
+        <label><span>Versandformat</span><select name="send_format">{send_format_options}</select></label>
       </div>
       <div class="form-actions"><a class="button" href="/customer/{customer_id}">Abbrechen</a>
       <button class="button primary">Dauerrechnung speichern</button></div>
     </form>"""
 
 
-def send_document_email(connection, document_id: int):
+def send_document_email(connection, document_id: int, pdf_format: str = "auto"):
     document = fetch_document(connection, document_id)
     if not document or document["status"] not in ("final", "sent"):
         raise ValueError("Nur fertiggestellte Dokumente können versendet werden.")
     if not document["customer_email"]:
         raise ValueError("Beim Kunden ist keine Rechnungs-E-Mail hinterlegt.")
-    pdf = preferred_document_pdf(connection, document_id)
+    pdf = resolve_document_pdf(connection, document_id, pdf_format)
     settings = DB.settings()
     company_name = settings.get("company_name", "")
     closing_name = settings.get("owner_name") or company_name
@@ -1516,7 +1562,13 @@ def run_recurring_invoice(connection, recurring_id: int, run_date: date, manual:
             finalize_document(connection, document_id)
             status = "finalized"
         if template["auto_send"]:
-            send_document_email(connection, document_id)
+            if template["send_format"] in ("zugferd", "auto"):
+                try:
+                    generate_zugferd(connection, document_id)
+                except Exception:
+                    if template["send_format"] == "zugferd":
+                        raise
+            send_document_email(connection, document_id, template["send_format"])
             status = "sent"
     except Exception as exc:
         status = "send_failed"
@@ -2497,24 +2549,73 @@ def application(environ, start_response):
                 auto_send = 1 if form.get("auto_send") == "on" else 0
                 if auto_send and (not customer or not customer["email"]):
                     raise ValueError("Für automatischen Versand fehlt die Rechnungs-E-Mail.")
+                send_format = str(form.get("send_format", "auto")).strip()
+                if send_format not in ("auto", "pdf", "zugferd"):
+                    raise ValueError("Ungültiges Versandformat.")
                 now = Database.now()
                 recurring_id = connection.execute(
                     """
                     INSERT INTO recurring_invoices(customer_id, active, title, category, description,
                     service_period_template, quantity_milli, unit, unit_price_cents, billing_day,
-                    auto_finalize, auto_send, created_at, updated_at)
-                    VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    auto_finalize, auto_send, send_format, created_at, updated_at)
+                    VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         customer_id, form.get("title", "").strip(), form.get("category", "").strip(),
                         form["description"].strip(), form.get("service_period_template", "{monat} {jahr}").strip(),
                         quantity_milli(form.get("quantity", "1")), form.get("unit", "pauschal").strip(),
                         cents(form["unit_price"]), int(form["billing_day"]),
-                        1 if form.get("auto_finalize") == "on" or auto_send else 0, auto_send, now, now,
+                        1 if form.get("auto_finalize") == "on" or auto_send else 0, auto_send,
+                        send_format, now, now,
                     ),
                 ).lastrowid
                 Database.audit(connection, "recurring_invoice", recurring_id, "created")
                 return redirect(start_response, f"/customer/{customer_id}", "Monatliche Rechnung wurde eingerichtet.")
+            elif method == "GET" and re.fullmatch(r"/recurring/\d+/edit", path):
+                recurring_id = int(path.split("/")[2])
+                template = connection.execute(
+                    "SELECT * FROM recurring_invoices WHERE id=?", (recurring_id,)
+                ).fetchone()
+                if not template:
+                    raise ValueError("Dauerrechnung wurde nicht gefunden.")
+                body, title, active = (
+                    recurring_form(connection, template["customer_id"], template),
+                    "Dauerrechnung bearbeiten", "customers",
+                )
+            elif method == "POST" and re.fullmatch(r"/recurring/\d+/edit", path):
+                recurring_id = int(path.split("/")[2])
+                existing = connection.execute(
+                    "SELECT customer_id FROM recurring_invoices WHERE id=?", (recurring_id,)
+                ).fetchone()
+                if not existing:
+                    raise ValueError("Dauerrechnung wurde nicht gefunden.")
+                customer_id = existing["customer_id"]
+                form = parse_form(environ)
+                customer = connection.execute("SELECT email FROM customers WHERE id=?", (customer_id,)).fetchone()
+                auto_send = 1 if form.get("auto_send") == "on" else 0
+                if auto_send and (not customer or not customer["email"]):
+                    raise ValueError("Für automatischen Versand fehlt die Rechnungs-E-Mail.")
+                send_format = str(form.get("send_format", "auto")).strip()
+                if send_format not in ("auto", "pdf", "zugferd"):
+                    raise ValueError("Ungültiges Versandformat.")
+                connection.execute(
+                    """
+                    UPDATE recurring_invoices SET title=?, category=?, description=?,
+                    service_period_template=?, quantity_milli=?, unit=?, unit_price_cents=?,
+                    billing_day=?, auto_finalize=?, auto_send=?, send_format=?, updated_at=?
+                    WHERE id=?
+                    """,
+                    (
+                        form.get("title", "").strip(), form.get("category", "").strip(),
+                        form["description"].strip(), form.get("service_period_template", "{monat} {jahr}").strip(),
+                        quantity_milli(form.get("quantity", "1")), form.get("unit", "pauschal").strip(),
+                        cents(form["unit_price"]), int(form["billing_day"]),
+                        1 if form.get("auto_finalize") == "on" or auto_send else 0, auto_send,
+                        send_format, Database.now(), recurring_id,
+                    ),
+                )
+                Database.audit(connection, "recurring_invoice", recurring_id, "updated")
+                return redirect(start_response, f"/customer/{customer_id}", "Monatliche Rechnung wurde aktualisiert.")
             elif method == "POST" and re.fullmatch(r"/recurring/\d+/toggle", path):
                 recurring_id = int(path.split("/")[2])
                 template = connection.execute(
@@ -2781,7 +2882,11 @@ def application(environ, start_response):
                 return redirect(start_response, f"/document/new?type={target}&source={source_id}")
             elif method == "POST" and re.fullmatch(r"/document/\d+/send", path):
                 document_id = int(path.split("/")[2])
-                send_document_email(connection, document_id)
+                form = parse_form(environ)
+                pdf_format = str(form.get("format", "auto")).strip()
+                if pdf_format not in ("auto", "pdf", "zugferd"):
+                    raise ValueError("Ungültiges Versandformat.")
+                send_document_email(connection, document_id, pdf_format)
                 return redirect(start_response, f"/document/{document_id}", "E-Mail wurde über Microsoft Graph versendet.")
             elif method == "GET" and path == "/reminders":
                 body, title, active = (

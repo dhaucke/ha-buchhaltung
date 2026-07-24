@@ -149,6 +149,7 @@ CREATE TABLE IF NOT EXISTS recurring_invoices (
     billing_day INTEGER NOT NULL DEFAULT 1 CHECK(billing_day BETWEEN 1 AND 28),
     auto_finalize INTEGER NOT NULL DEFAULT 1,
     auto_send INTEGER NOT NULL DEFAULT 0,
+    send_format TEXT NOT NULL DEFAULT 'auto' CHECK(send_format IN ('auto','pdf','zugferd')),
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -358,6 +359,14 @@ class Database:
             if "payment_terms_days" not in supplier_columns:
                 connection.execute(
                     "ALTER TABLE suppliers ADD COLUMN payment_terms_days INTEGER"
+                )
+            recurring_columns = {
+                row["name"] for row in connection.execute("PRAGMA table_info(recurring_invoices)")
+            }
+            if "send_format" not in recurring_columns:
+                connection.execute(
+                    "ALTER TABLE recurring_invoices ADD COLUMN send_format "
+                    "TEXT NOT NULL DEFAULT 'auto'"
                 )
             self.link_archives_by_customer_number(connection)
 
