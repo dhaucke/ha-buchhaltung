@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.6.2
+
+- Microsoft-Graph-Einrichtung überarbeitet: alle Felder (Tenant-ID,
+  Client-ID, Dienstprinzipal-Objekt-ID, Absenderadresse, Zertifikat,
+  privater Schlüssel) sind jetzt gesammelt auf der Microsoft-
+  Einrichtungsseite statt auf zwei Seiten verteilt
+- direkter Link zur passenden Entra-App-Registrierung, sobald die
+  Client-ID eingetragen ist
+- Status zeigt konkret an, welche Angaben noch fehlen, statt nur
+  „vollständig/unvollständig“
+
 ## 0.6.1
 
 - Lieferantenerkennung bei Eingangsrechnungen unterstützt jetzt auch

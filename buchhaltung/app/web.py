@@ -2049,9 +2049,6 @@ def settings_page(settings: dict[str, str]) -> str:
         ("phone", "Telefon"), ("email", "E-Mail"),
         ("website", "Website"), ("tax_number", "Steuernummer"), ("iban", "IBAN"), ("bic", "BIC"),
         ("bank_name", "Bank"), ("payment_terms_days", "Zahlungsziel in Tagen"),
-        ("graph_tenant_id", "Microsoft Tenant-ID"), ("graph_client_id", "Microsoft Client-ID"),
-        ("graph_service_principal_object_id", "Dienstprinzipal-Objekt-ID"),
-        ("graph_sender", "Graph-Absender"),
     ]
     inputs = "".join(
         f'<label><span>{h(label)}</span><input name="{h(key)}" value="{h(settings.get(key, ""))}"></label>'
@@ -2066,9 +2063,12 @@ def settings_page(settings: dict[str, str]) -> str:
     )
     checked = "checked" if settings.get("small_business_enabled", "1") == "1" else ""
     return f"""
-    <form class="card form" method="post" action="/settings" enctype="multipart/form-data">
+    <div class="card">
       <div class="settings-status"><span class="status {'paid' if graph_status else 'draft'}">
       Microsoft Graph: {'eingerichtet' if graph_status else 'noch nicht vollständig'}</span></div>
+      <div class="form-actions"><a class="button" href="/settings/microsoft">Microsoft-Einrichtung öffnen</a></div>
+    </div>
+    <form class="card form" method="post" action="/settings" enctype="multipart/form-data">
       <div class="form-grid">
       <label class="wide"><span>Unternehmenslogo</span>{logo_preview}
       <input type="file" name="logo" accept="image/png,image/jpeg,image/webp"></label>
@@ -2077,14 +2077,8 @@ def settings_page(settings: dict[str, str]) -> str:
       <span>Kleinunternehmerregelung nach § 19 UStG verwenden</span></label>
       <label class="wide"><span>Kleinunternehmer-Hinweis</span>
       <input name="small_business_notice" value="{h(settings.get('small_business_notice'))}"></label>
-      <label><span>Öffentliches Zertifikat (PEM)</span>
-      <input type="file" name="graph_certificate" accept=".pem,.crt"></label>
-      <label><span>Privater Schlüssel (PEM)</span>
-      <input type="file" name="graph_private_key" accept=".pem,.key"></label></div>
-      <p class="notice">Der private Schlüssel wird nur im persistenten App-Datenverzeichnis
-      mit eingeschränkten Dateirechten gespeichert und gehört in ein verschlüsseltes Backup.</p>
-      <div class="form-actions"><a class="button" href="/settings/microsoft">Microsoft-Einrichtung öffnen</a>
-      <button class="button primary">Einstellungen speichern</button></div>
+      </div>
+      <div class="form-actions"><button class="button primary">Einstellungen speichern</button></div>
     </form>"""
 
 
@@ -2094,36 +2088,82 @@ def microsoft_setup_page(settings: dict[str, str]) -> str:
     sender = settings.get("graph_sender", "")
     scope_name = "Buchhaltung-Mailbox"
     assignment_name = "Buchhaltung-Mail.Send"
-    complete = all((client_id, object_id, sender))
+    tenant_id = settings.get("graph_tenant_id", "")
+    graph_status = GraphClient(settings).configured()
+    missing = []
+    if not tenant_id:
+        missing.append("Tenant-ID")
+    if not client_id:
+        missing.append("Client-ID")
+    if not object_id:
+        missing.append("Dienstprinzipal-Objekt-ID")
+    if not sender:
+        missing.append("Absenderadresse")
+    if not Path(settings.get("graph_certificate_path", "")).is_file():
+        missing.append("Zertifikat")
+    if not Path(settings.get("graph_private_key_path", "")).is_file():
+        missing.append("privater Schlüssel")
+    status_text = "vollständig eingerichtet" if not missing else "fehlt noch: " + ", ".join(missing)
     commands = f"""Connect-ExchangeOnline
 New-ServicePrincipal -AppId "{client_id or '<CLIENT-ID>'}" -ObjectId "{object_id or '<DIENSTPRINZIPAL-OBJEKT-ID>'}" -DisplayName "Buchhaltung"
 New-ManagementScope -Name "{scope_name}" -RecipientRestrictionFilter "PrimarySmtpAddress -eq '{sender or '<ABSENDER-POSTFACH>'}'"
 New-ManagementRoleAssignment -Name "{assignment_name}" -Role "Application Mail.Send" -App "{object_id or '<DIENSTPRINZIPAL-OBJEKT-ID>'}" -CustomResourceScope "{scope_name}"
 Test-ServicePrincipalAuthorization -Identity "{object_id or '<DIENSTPRINZIPAL-OBJEKT-ID>'}" -Resource "{sender or '<ABSENDER-POSTFACH>'}" | Format-Table"""
-    graph_status = GraphClient(settings).configured()
+    app_registration_url = (
+        f"https://portal.azure.com/#blade/Microsoft_AAD_RegisteredApps/"
+        f"ApplicationMenuBlade/Overview/appId/{urllib.parse.quote(client_id)}"
+        if client_id else "https://entra.microsoft.com"
+    )
+    enterprise_apps_url = "https://entra.microsoft.com"
+    fields = [
+        ("graph_tenant_id", "Microsoft Tenant-ID"), ("graph_client_id", "Microsoft Client-ID"),
+        ("graph_service_principal_object_id", "Dienstprinzipal-Objekt-ID"),
+        ("graph_sender", "Absenderadresse"),
+    ]
+    inputs = "".join(
+        f'<label><span>{h(label)}</span><input name="{h(key)}" value="{h(settings.get(key, ""))}"></label>'
+        for key, label in fields
+    )
     return f"""
     <div class="card form">
       <h2>Entra und Exchange Application RBAC</h2>
       <p>Diese Variante beschränkt die Anwendung in Exchange auf genau das eingetragene
       Absenderpostfach. Die Befehle müssen mit der Rolle Exchange-Administrator ausgeführt werden.</p>
       <ol class="setup-guide">
-        <li><b>Entra-App registrieren.</b> Tenant-ID und Client-ID in den Einstellungen eintragen.</li>
-        <li><b>Zertifikat hochladen.</b> Den öffentlichen Anteil zusätzlich unter
-        „Zertifikate &amp; Geheimnisse“ in der App-Registrierung hinterlegen.</li>
-        <li><b>Dienstprinzipal-Objekt-ID ermitteln.</b> Dafür unter
-        „Unternehmensanwendungen“ die App öffnen; nicht die Objekt-ID der App-Registrierung verwenden.</li>
+        <li><b>Entra-App registrieren.</b>
+        <a class="button" target="_blank" href="{h(app_registration_url)}">
+        {'App-Registrierung öffnen' if client_id else 'App registrieren'}</a>
+        Tenant-ID und Client-ID unten eintragen.</li>
+        <li><b>Zertifikat hochladen.</b> Den öffentlichen Anteil zusätzlich in der App-Registrierung
+        unter „Zertifikate &amp; Geheimnisse“ hinterlegen.</li>
+        <li><b>Dienstprinzipal-Objekt-ID ermitteln.</b>
+        <a class="button" target="_blank" href="{h(enterprise_apps_url)}">Unternehmensanwendungen öffnen</a>
+        dort nach der Client-ID suchen und die Objekt-ID der Anwendung übernehmen
+        (nicht die Objekt-ID der App-Registrierung).</li>
         <li><b>Exchange RBAC ausführen.</b> Die folgenden Befehle in Exchange Online PowerShell verwenden.</li>
       </ol>
       <pre class="command-block">{h(commands)}</pre>
-      <div class="alert {'success' if complete and graph_status else ''}">
-      Stammdaten: {'vollständig' if complete else 'unvollständig'} ·
-      Zertifikatsdateien: {'vorhanden' if graph_status else 'unvollständig'}</div>
+    </div>
+    <form class="card form" method="post" action="/settings" enctype="multipart/form-data">
+      <input type="hidden" name="return_to" value="/settings/microsoft">
+      <div class="settings-status"><span class="status {'paid' if not missing else 'draft'}">
+      Microsoft Graph: {h(status_text)}</span></div>
+      <div class="form-grid">
+      {inputs}
+      <label><span>Öffentliches Zertifikat (PEM)</span>
+      <input type="file" name="graph_certificate" accept=".pem,.crt"></label>
+      <label><span>Privater Schlüssel (PEM)</span>
+      <input type="file" name="graph_private_key" accept=".pem,.key"></label>
+      </div>
+      <p class="notice">Der private Schlüssel wird nur im persistenten App-Datenverzeichnis
+      mit eingeschränkten Dateirechten gespeichert und gehört in ein verschlüsseltes Backup.</p>
       <p class="notice"><b>Wichtig:</b> Wenn „Application Mail.Send“ zusätzlich als
       organisationsweite Graph-Anwendungsberechtigung mit Admin-Zustimmung in Entra vergeben
       wird, wirkt diese additiv und hebt den engen Exchange-RBAC-Bereich praktisch auf.</p>
       <div class="form-actions"><a class="button" href="/settings">Zurück zu Einstellungen</a>
-      {'<form method="post" action="/settings/microsoft/test"><button class="button primary">Zertifikatsanmeldung testen</button></form>' if graph_status else ''}</div>
-    </div>"""
+      <button class="button primary">Speichern</button></div>
+    </form>
+    {'<form method="post" action="/settings/microsoft/test"><button class="button primary">Zertifikatsanmeldung testen</button></form>' if graph_status else ''}"""
 
 
 class ThreadingWSGIServer(ThreadingMixIn, WSGIServer):
@@ -3143,7 +3183,11 @@ def application(environ, start_response):
                     if not 0 <= terms <= 365:
                         raise ValueError("Das Zahlungsziel muss zwischen 0 und 365 Tagen liegen.")
                 DB.update_settings(values)
-                return redirect(start_response, "/settings", "Einstellungen wurden gespeichert.")
+                return_to = (
+                    "/settings/microsoft" if form.get("return_to") == "/settings/microsoft"
+                    else "/settings"
+                )
+                return redirect(start_response, return_to, "Einstellungen wurden gespeichert.")
             else:
                 return response(start_response, layout("Nicht gefunden", "<div class='alert error'>Seite nicht gefunden.</div>"), 404)
     except (ValueError, sqlite3.Error, RuntimeError) as exc:

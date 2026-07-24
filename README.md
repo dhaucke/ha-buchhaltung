@@ -104,10 +104,12 @@ Benötigt werden:
 - Exchange Online Application RBAC, begrenzt auf das gewünschte Absenderpostfach
 - Zertifikat und privater Schlüssel im PEM-Format
 
-Tenant-ID, Client-ID, Dienstprinzipal-Objekt-ID und Absenderadresse werden unter
-„Einstellungen“ eingetragen. Zertifikat und privater Schlüssel können dort
-direkt hochgeladen werden; ein SMB-Zugriff auf Home Assistant ist dafür nicht
-nötig. Die Microsoft-Einrichtung zeigt die passenden Exchange-Online-
+Tenant-ID, Client-ID, Dienstprinzipal-Objekt-ID, Absenderadresse sowie
+Zertifikat und privater Schlüssel werden gesammelt unter „Microsoft-
+Einrichtung“ eingetragen (nicht mehr auf der allgemeinen Einstellungsseite
+verteilt); ein SMB-Zugriff auf Home Assistant ist dafür nicht nötig. Die
+Seite verlinkt direkt auf die passende App-Registrierung in Entra, zeigt an,
+welche Angaben noch fehlen, listet die passenden Exchange-Online-
 PowerShell-Befehle und bietet einen Verbindungstest ohne Mailversand.
 
 Die enge Exchange-RBAC-Rolle `Application Mail.Send` ist der
