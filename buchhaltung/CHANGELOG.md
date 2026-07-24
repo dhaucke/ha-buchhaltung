@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.5.9
+
+- Lieferanten können ein eigenes Zahlungsziel in Tagen hinterlegen
+  (z. B. 14 Tage)
+- Zahlungsdatum und Fälligkeit werden bei Eingangsrechnungen automatisch
+  vorgeschlagen (Rechnungsdatum + Zahlungsziel, Wochenenden auf Montag
+  verschoben)
+- Anlegen einer Eingangsrechnung aus einem Archiv-Beleg markiert diesen
+  direkt als geprüft, kein separater Klick mehr nötig
+
+## 0.5.8
+
+- Lieferantenerkennung bei Eingangsrechnungen liest jetzt die
+  Retouradress-Zeile aus statt fälschlich den eigenen Empfängerblock zu
+  verwenden
+- Rechnungsnummern werden auch erkannt, wenn sie nicht dem bisherigen
+  Jahres-Bindestrich-Schema folgen (z. B. reine Ziffernfolgen oder das
+  Label „Dokumentnummer“)
+- fehlerhafte Worttrennung bei eng gesetztem PDF-Text wird korrigiert
+- Erkennung des Rechnungsendbetrags übernimmt keine „Netto“-Zwischensummen
+  mehr und unterstützt negative Beträge (Gutschriften)
+
 ## 0.5.7
 
 - Ausgangsrechnungen werden beim Markieren als bezahlt automatisch einem
