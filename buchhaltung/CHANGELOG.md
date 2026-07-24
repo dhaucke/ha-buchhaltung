@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.5.5
+
+- Archivliste wird nach Rechnungsnummer absteigend sortiert
+- die höchste und damit neueste Rechnungsnummer steht immer zuerst
+- die fortlaufende Prüfliste verwendet dieselbe Reihenfolge
+- Belege ohne erkannte Rechnungsnummer werden am Ende einsortiert
+- importierte Rechnungen in der Kundenakte folgen ebenfalls dieser Sortierung
+
 ## 0.5.4
 
 - Zahlungsdatum bei historischen Ausgangsrechnungen wird automatisch

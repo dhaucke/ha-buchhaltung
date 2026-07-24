@@ -332,9 +332,21 @@ class CoreTests(unittest.TestCase):
                 """
                 INSERT INTO archive_files(
                     original_filename, stored_filename, sha256, mime_type,
-                    file_size, uploaded_at, document_direction
+                    file_size, uploaded_at, document_direction,
+                    detected_invoice_number
                 ) VALUES ('eins.pdf','eins.pdf','queue-one','application/pdf',
-                          123,?,'outgoing')
+                          123,?,'outgoing','2025-12-0099')
+                """,
+                (now,),
+            ).lastrowid
+            newest_id = connection.execute(
+                """
+                INSERT INTO archive_files(
+                    original_filename, stored_filename, sha256, mime_type,
+                    file_size, uploaded_at, document_direction,
+                    detected_invoice_number
+                ) VALUES ('neu.pdf','neu.pdf','queue-new','application/pdf',
+                          123,?,'outgoing','2026-07-0133')
                 """,
                 (now,),
             ).lastrowid
@@ -366,7 +378,8 @@ class CoreTests(unittest.TestCase):
                 connection, None, "incoming"
             )
 
-        self.assertEqual(outgoing_next, first_id)
+        self.assertNotEqual(first_id, newest_id)
+        self.assertEqual(outgoing_next, newest_id)
         self.assertEqual(incoming_next, incoming_id)
 
     def test_recurring_invoice_schema_exists(self):

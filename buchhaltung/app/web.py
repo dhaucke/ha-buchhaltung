@@ -629,7 +629,14 @@ def customer_detail(connection, customer_id: int) -> str:
     )
     archive = rows(
         connection,
-        "SELECT * FROM archive_files WHERE customer_id=? ORDER BY detected_issue_date DESC, id DESC",
+        """
+        SELECT * FROM archive_files WHERE customer_id=?
+        ORDER BY
+          CASE WHEN trim(detected_invoice_number)='' THEN 1 ELSE 0 END,
+          detected_invoice_number COLLATE NOCASE DESC,
+          detected_issue_date DESC,
+          id DESC
+        """,
         (customer_id,),
     )
     document_rows = "".join(
@@ -1471,7 +1478,12 @@ def archive_page(connection) -> str:
         LEFT JOIN customers c ON c.id=a.customer_id
         LEFT JOIN documents d ON d.id=a.document_id
         LEFT JOIN incoming_invoices i ON i.archive_file_id=a.id
-        ORDER BY a.uploaded_at DESC
+        ORDER BY
+          CASE WHEN trim(a.detected_invoice_number)='' THEN 1 ELSE 0 END,
+          a.detected_invoice_number COLLATE NOCASE DESC,
+          a.detected_issue_date DESC,
+          a.uploaded_at DESC,
+          a.id DESC
         """,
     )
     open_files = [file for file in files if not file["reviewed_at"]]

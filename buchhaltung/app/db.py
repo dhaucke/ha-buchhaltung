@@ -529,7 +529,12 @@ class Database:
             f"""
             SELECT id FROM archive_files
             WHERE {' AND '.join(conditions)}
-            ORDER BY uploaded_at DESC, id DESC
+            ORDER BY
+              CASE WHEN trim(detected_invoice_number)='' THEN 1 ELSE 0 END,
+              detected_invoice_number COLLATE NOCASE DESC,
+              detected_issue_date DESC,
+              uploaded_at DESC,
+              id DESC
             LIMIT 1
             """,
             tuple(parameters),
