@@ -1,0 +1,23 @@
+name: "Buchhaltung"
+description: "Lokale Angebote, Auftragsbestätigungen, Rechnungen und Dauerrechnungen"
+version: "0.3.0"
+slug: "buchhaltung"
+url: "https://github.com/dhaucke/ha-buchhaltung"
+init: false
+startup: services
+boot: auto
+arch:
+  - amd64
+  - aarch64
+ingress: true
+ingress_port: 8099
+panel_icon: "mdi:receipt-text-edit"
+panel_title: "Buchhaltung"
+ports:
+  8099/tcp: null
+ports_description:
+  8099/tcp: "Direkter Webzugriff (optional)"
+map:
+  - app_config:rw
+options: {}
+schema: {}
