@@ -1,0 +1,13 @@
+services:
+  buchhaltung:
+    build:
+      context: ./buchhaltung
+    container_name: buchhaltung
+    restart: unless-stopped
+    ports:
+      - "8099:8099"
+    environment:
+      HD_DATA_DIR: /data
+      HD_PORT: "8099"
+    volumes:
+      - ./data:/data
