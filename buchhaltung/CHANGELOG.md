@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.7.1
+
+- Dokumentenliste in der Kundenansicht zeigt standardmäßig nur die
+  letzten 20 Einträge mit einem „Alle anzeigen“-Link, statt unbegrenzt
+  alle Dokumente und Archiv-Rechnungen aufzulisten
+- Dokumente und Archiv-Rechnungen werden dabei jetzt chronologisch
+  gemischt sortiert statt Archiv-Rechnungen immer unabhängig vom Datum
+  ans Ende zu hängen
+
 ## 0.7.0
 
 - Dauerrechnungen können jetzt nachträglich bearbeitet werden (Preis,

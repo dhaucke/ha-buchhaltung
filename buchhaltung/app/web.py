@@ -669,7 +669,7 @@ def customer_form(customer=None) -> str:
     </form>"""
 
 
-def customer_detail(connection, customer_id: int) -> str:
+def customer_detail(connection, customer_id: int, show_all_documents: bool = False) -> str:
     customer = connection.execute("SELECT * FROM customers WHERE id=?", (customer_id,)).fetchone()
     if not customer:
         raise ValueError("Kunde wurde nicht gefunden.")
@@ -690,22 +690,41 @@ def customer_detail(connection, customer_id: int) -> str:
         """,
         (customer_id,),
     )
-    document_rows = "".join(
-        f"""<tr><td><a href="/document/{d['id']}">{h(d['document_number'] or 'Entwurf')}</a></td>
-        <td>{h(TYPE_LABELS[d['document_type']])}</td><td>{german_date(d['issue_date'])}</td>
-        <td class="money">{money(d['total_cents'])}</td>
-        <td><span class="status {h(d['status'])}">{h(DOCUMENT_STATUS.get(d['status'], d['status']))}</span></td></tr>"""
+    entries = [
+        (
+            (d["issue_date"] or "", d["id"]),
+            f"""<tr><td><a href="/document/{d['id']}">{h(d['document_number'] or 'Entwurf')}</a></td>
+            <td>{h(TYPE_LABELS[d['document_type']])}</td><td>{german_date(d['issue_date'])}</td>
+            <td class="money">{money(d['total_cents'])}</td>
+            <td><span class="status {h(d['status'])}">{h(DOCUMENT_STATUS.get(d['status'], d['status']))}</span></td></tr>""",
+        )
         for d in documents
-    )
-    document_rows += "".join(
-        f"""<tr><td><a href="/archive/{a['id']}">{h(a['detected_invoice_number'] or a['original_filename'])}</a></td>
-        <td>Archiv-Rechnung</td><td>{german_date(a['detected_issue_date']) if a['detected_issue_date'] else '–'}</td>
-        <td class="money">{money(a['detected_amount_cents']) if a['detected_amount_cents'] is not None else '–'}</td>
-        <td><a class="button compact" target="_blank" href="/archive/{a['id']}/pdf">PDF öffnen</a></td></tr>"""
+    ] + [
+        (
+            (a["detected_issue_date"] or "", a["id"]),
+            f"""<tr><td><a href="/archive/{a['id']}">{h(a['detected_invoice_number'] or a['original_filename'])}</a></td>
+            <td>Archiv-Rechnung</td><td>{german_date(a['detected_issue_date']) if a['detected_issue_date'] else '–'}</td>
+            <td class="money">{money(a['detected_amount_cents']) if a['detected_amount_cents'] is not None else '–'}</td>
+            <td><a class="button compact" target="_blank" href="/archive/{a['id']}/pdf">PDF öffnen</a></td></tr>""",
+        )
         for a in archive
-    )
+    ]
+    entries.sort(key=lambda entry: entry[0], reverse=True)
+    total_entries = len(entries)
+    document_limit = 20
+    visible_entries = entries if show_all_documents else entries[:document_limit]
+    document_rows = "".join(html for _, html in visible_entries)
     if not document_rows:
         document_rows = '<tr><td colspan="5" class="empty">Noch keine Dokumente für diesen Kunden.</td></tr>'
+    documents_toggle = ""
+    if total_entries > document_limit:
+        documents_toggle = (
+            f'<a class="button compact" href="/customer/{customer_id}">'
+            f'Nur die letzten {document_limit} anzeigen</a>'
+            if show_all_documents else
+            f'<a class="button compact" href="/customer/{customer_id}?all=1">'
+            f'Alle {total_entries} anzeigen</a>'
+        )
 
     templates = rows(
         connection,
@@ -743,7 +762,8 @@ def customer_detail(connection, customer_id: int) -> str:
     <div><span>Ansprechpartner</span><strong>{h(customer['contact_name'] or '–')}</strong></div>
     <div><span>Rechnungs-E-Mail</span><strong>{email_note}</strong></div>
     <div><span>Anschrift</span><strong>{h(customer['street'])}<br>{h(customer['postal_code'])} {h(customer['city'])}</strong></div></div>
-    <div class="card"><div class="card-head"><h2>Dokumente und importierte Rechnungen</h2></div>
+    <div class="card"><div class="card-head split-head"><h2>Dokumente und importierte Rechnungen</h2>
+    {documents_toggle}</div>
     <div class="table-wrap"><table><thead><tr><th>Nummer</th><th>Art</th><th>Datum</th><th>Betrag</th><th>Status</th></tr></thead>
     <tbody>{document_rows}</tbody></table></div></div>
     <div class="card"><div class="card-head split-head"><div><h2>Monatliche Rechnungen</h2>
@@ -2513,7 +2533,11 @@ def application(environ, start_response):
             elif method == "GET" and re.fullmatch(r"/customer/\d+", path):
                 customer_id = int(path.split("/")[2])
                 customer = connection.execute("SELECT company FROM customers WHERE id=?", (customer_id,)).fetchone()
-                body, title, active = customer_detail(connection, customer_id), customer["company"], "customers"
+                show_all_documents = query.get("all", ["0"])[0] == "1"
+                body, title, active = (
+                    customer_detail(connection, customer_id, show_all_documents),
+                    customer["company"], "customers",
+                )
             elif method == "GET" and re.fullmatch(r"/customer/\d+/edit", path):
                 customer_id = int(path.split("/")[2])
                 customer = connection.execute("SELECT * FROM customers WHERE id=?", (customer_id,)).fetchone()
