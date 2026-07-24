@@ -1,0 +1,8 @@
+data/
+tests/
+tmp/
+__pycache__/
+*.pyc
+*.sqlite3
+*.zip
+
