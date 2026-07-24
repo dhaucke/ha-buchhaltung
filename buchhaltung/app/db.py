@@ -106,6 +106,7 @@ CREATE TABLE IF NOT EXISTS suppliers (
     email TEXT NOT NULL DEFAULT '',
     tax_number TEXT NOT NULL DEFAULT '',
     iban TEXT NOT NULL DEFAULT '',
+    payment_terms_days INTEGER,
     notes TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
@@ -347,6 +348,13 @@ class Database:
                     connection.execute(
                         f"ALTER TABLE documents ADD COLUMN {column} {definition}"
                     )
+            supplier_columns = {
+                row["name"] for row in connection.execute("PRAGMA table_info(suppliers)")
+            }
+            if "payment_terms_days" not in supplier_columns:
+                connection.execute(
+                    "ALTER TABLE suppliers ADD COLUMN payment_terms_days INTEGER"
+                )
             self.link_archives_by_customer_number(connection)
 
     def settings(self) -> dict[str, str]:

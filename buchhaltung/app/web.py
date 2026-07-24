@@ -1874,7 +1874,8 @@ def incoming_detail(connection, incoming_id: int) -> str:
                COALESCE(NULLIF(s.street,''), a.detected_street) supplier_street,
                COALESCE(NULLIF(s.postal_code,''), a.detected_postal_code) supplier_postal_code,
                COALESCE(NULLIF(s.city,''), a.detected_city) supplier_city,
-               COALESCE(s.email,'') supplier_email
+               COALESCE(s.email,'') supplier_email,
+               s.payment_terms_days supplier_payment_terms_days
         FROM incoming_invoices i
         LEFT JOIN archive_files a ON a.id=i.archive_file_id
         LEFT JOIN suppliers s ON s.id=i.supplier_id
@@ -1887,7 +1888,7 @@ def incoming_detail(connection, incoming_id: int) -> str:
     suppliers = rows(
         connection,
         """
-        SELECT company, contact_name, street, postal_code, city, email
+        SELECT company, contact_name, street, postal_code, city, email, payment_terms_days
         FROM suppliers ORDER BY company COLLATE NOCASE
         """,
     )
@@ -1899,9 +1900,16 @@ def incoming_detail(connection, incoming_id: int) -> str:
             "contact": supplier["contact_name"], "street": supplier["street"],
             "postal_code": supplier["postal_code"], "city": supplier["city"],
             "email": supplier["email"],
+            "terms": "" if supplier["payment_terms_days"] is None else supplier["payment_terms_days"],
         }
         for supplier in suppliers
     })
+    supplier_terms = item["supplier_payment_terms_days"]
+    if supplier_terms in (None, ""):
+        supplier_terms = DB.settings().get("payment_terms_days", "14")
+    payment_value = item["payment_date"] or suggested_payment_date(
+        item["invoice_date"], supplier_terms
+    )
     category_options = "".join(
         f'<option value="{h(category)}" {"selected" if category == item["eur_category"] else ""}>{h(category)}</option>'
         for category in EXPENSE_CATEGORIES
@@ -1939,13 +1947,16 @@ def incoming_detail(connection, incoming_id: int) -> str:
         <label><span>PLZ</span><input {readonly} id="supplier-postal-code" name="supplier_postal_code" value="{h(item['supplier_postal_code'])}"></label>
         <label><span>Ort</span><input {readonly} id="supplier-city" name="supplier_city" value="{h(item['supplier_city'])}"></label>
         <label><span>E-Mail</span><input {readonly} type="email" id="supplier-email" name="supplier_email" value="{h(item['supplier_email'])}"></label>
+        <label><span>Zahlungsziel in Tagen</span><input {readonly} type="number" min="0" max="365"
+          id="supplier-terms" name="supplier_terms"
+          value="{h('' if item['supplier_payment_terms_days'] is None else str(item['supplier_payment_terms_days']))}"></label>
       </div>
       <h3>Buchungsdaten</h3>
       <div class="form-grid">
         <label><span>Rechnungsnummer</span><input {readonly} name="invoice_number" value="{h(item['invoice_number'])}"></label>
         <label><span>Rechnungsdatum *</span><input {readonly} required type="date" name="invoice_date" value="{h(item['invoice_date'])}"></label>
-        <label><span>Fällig am</span><input {readonly} type="date" name="due_date" value="{h(item['due_date'])}"></label>
-        <label><span>Zahlungsdatum</span><input {readonly} type="date" name="payment_date" value="{h(item['payment_date'])}"></label>
+        <label><span>Fällig am</span><input {readonly} type="date" name="due_date" value="{h(item['due_date'] or payment_value)}"></label>
+        <label><span>Zahlungsdatum</span><input {readonly} type="date" name="payment_date" value="{h(payment_value)}"></label>
         <label><span>Bruttobetrag in EUR *</span><input {readonly} required name="gross_amount" value="{h(gross)}"></label>
         <label><span>Betrieblicher Anteil in %</span><input {readonly} type="number" min="0" max="100" name="business_share_percent" value="{item['business_share_percent']}"></label>
         <label class="wide"><span>EÜR-Kategorie *</span><select {readonly} name="eur_category">{category_options}</select></label>
@@ -1967,6 +1978,7 @@ def incoming_detail(connection, incoming_id: int) -> str:
         postal_code: document.getElementById("supplier-postal-code"),
         city: document.getElementById("supplier-city"),
         email: document.getElementById("supplier-email"),
+        terms: document.getElementById("supplier-terms"),
       }};
       company.addEventListener("input", () => {{
         const match = suppliers[company.value.trim().toLowerCase()];
@@ -1976,6 +1988,7 @@ def incoming_detail(connection, incoming_id: int) -> str:
         fields.postal_code.value = match.postal_code;
         fields.city.value = match.city;
         fields.email.value = match.email;
+        fields.terms.value = match.terms;
       }});
     }})();
     </script>''' if editable else ''}"""
@@ -2919,6 +2932,10 @@ def application(environ, start_response):
                         now, now,
                     ),
                 ).lastrowid
+                connection.execute(
+                    "UPDATE archive_files SET reviewed_at=COALESCE(reviewed_at,?) WHERE id=?",
+                    (now, archive_id),
+                )
                 Database.audit(connection, "incoming_invoice", incoming_id, "draft_created_from_archive")
                 return redirect(
                     start_response, f"/incoming/{incoming_id}",
@@ -2945,19 +2962,21 @@ def application(environ, start_response):
                     (company,),
                 ).fetchone()
                 now = Database.now()
+                supplier_terms_raw = str(form.get("supplier_terms", "")).strip()
+                supplier_terms = int(supplier_terms_raw) if supplier_terms_raw else None
                 supplier_values = (
                     company, str(form.get("supplier_contact", "")).strip(),
                     str(form.get("supplier_street", "")).strip(),
                     str(form.get("supplier_postal_code", "")).strip(),
                     str(form.get("supplier_city", "")).strip(),
-                    str(form.get("supplier_email", "")).strip(), now,
+                    str(form.get("supplier_email", "")).strip(), supplier_terms, now,
                 )
                 if supplier:
                     supplier_id = supplier["id"]
                     connection.execute(
                         """
                         UPDATE suppliers SET company=?, contact_name=?, street=?, postal_code=?,
-                        city=?, email=?, updated_at=? WHERE id=?
+                        city=?, email=?, payment_terms_days=?, updated_at=? WHERE id=?
                         """,
                         (*supplier_values, supplier_id),
                     )
@@ -2966,8 +2985,8 @@ def application(environ, start_response):
                         """
                         INSERT INTO suppliers(
                             company, contact_name, street, postal_code, city, email,
-                            created_at, updated_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                            payment_terms_days, created_at, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (*supplier_values[:-1], now, now),
                     ).lastrowid
