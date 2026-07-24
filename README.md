@@ -23,7 +23,7 @@ ausschließlich im persistenten Datenverzeichnis gespeichert.
 - Teil- und Vollgutschriften mit Auszahlung oder Verrechnung
 - dreistufige Zahlungserinnerungen mit Vorschau vor dem Versand
 - ZUGFeRD-/Factur-X-Hybridrechnungen im Profil EN 16931 mit lokaler
-  XML-Schema-Validierung
+  XML-Schema- und EN-16931-Geschäftsregel-Validierung (Mustang, offline)
 - unveränderter Import alter PDF-Rechnungen mit SHA-256-Prüfsumme
 - Massenimport für bis zu 50 PDF-Belege (maximal 20 MB je Datei)
 - Dublettenprüfung anhand der Datei-Prüfsumme und der erkannten Belegdaten
@@ -121,13 +121,17 @@ Für fertiggestellte Rechnungen und Gutschriften kann ein ZUGFeRD-/Factur-X-PDF
 im Profil EN 16931 erzeugt werden. Die Anwendung:
 
 1. erzeugt den strukturierten CII-XML-Datensatz,
-2. validiert ihn lokal gegen das mitgelieferte XML-Schema,
-3. bettet ihn in das PDF ein und
-4. verwendet danach dieses Hybrid-PDF beim Mailversand.
+2. validiert ihn lokal gegen das mitgelieferte XML-Schema (XSD),
+3. prüft ihn zusätzlich gegen die EN-16931-Geschäftsregeln (Schematron) mit
+   dem offiziellen [Mustang-Validator](https://github.com/ZUGFeRD/mustangproject)
+   der ZUGFeRD-Organisation – vollständig offline, ohne externen Server,
+4. bettet ihn in das PDF ein und
+5. verwendet danach dieses Hybrid-PDF beim Mailversand.
 
-Die XRechnung mit vollständiger KoSIT-Geschäftsregelvalidierung ist noch nicht
-freigeschaltet. Eine bloß syntaktisch gültige XML-Datei wird bewusst nicht als
-„XRechnung-validiert“ bezeichnet.
+Ist im Container kein Java vorhanden (z. B. bei einer lokalen Entwicklungsumgebung
+außerhalb des mitgelieferten Docker-Images), wird nur die XSD-Prüfung
+durchgeführt; das Ergebnis vermerkt dann, dass die Schematron-Prüfung nicht
+verfügbar war, statt die Erzeugung abzulehnen.
 
 Kleinunternehmer sind aktuell von der Pflicht zur Ausstellung einer
 E-Rechnung ausgenommen, müssen E-Rechnungen aber empfangen können. Die

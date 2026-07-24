@@ -12,7 +12,26 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.13"
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - name: Mustang-CLI-Validator laden
+        run: |
+          mkdir -p /opt/mustang
+          curl -fsSL -o /opt/mustang/Mustang-CLI.jar \
+            https://github.com/ZUGFeRD/mustangproject/releases/download/core-2.24.0/Mustang-CLI-2.24.0.jar
+        env:
+          MUSTANG_CLI_JAR: /opt/mustang/Mustang-CLI.jar
       - name: Abhängigkeiten installieren
         run: pip install cryptography==45.0.7 factur-x==6.6 pillow==11.3.0 pdfplumber==0.11.7 reportlab==4.4.3
       - name: Anwendung testen
+        env:
+          MUSTANG_CLI_JAR: /opt/mustang/Mustang-CLI.jar
         run: python -m unittest discover -s tests -v
+  docker-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Add-on-Image bauen
+        run: docker build -t buchhaltung-test ./buchhaltung

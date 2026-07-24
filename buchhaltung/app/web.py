@@ -1249,19 +1249,25 @@ def generate_zugferd(connection, document_id: int) -> dict:
         )
         raise ValueError(f"ZUGFeRD-Validierung fehlgeschlagen: {exc}") from exc
     now = Database.now()
+    validation_message = (
+        "XML-Schema und EN-16931-Geschäftsregeln (Schematron) erfolgreich validiert."
+        if result.get("schematron_checked")
+        else "XML-Schema erfolgreich validiert. Schematron-Prüfung (Geschäftsregeln) "
+        "nicht verfügbar – Java-Validator ist in dieser Installation nicht vorhanden."
+    )
     connection.execute(
         """
         INSERT INTO e_invoice_files(
             document_id, profile, pdf_filename, xml_filename, xsd_valid,
             validation_message, generated_at
-        ) VALUES (?, ?, ?, ?, 1, 'XML-Schema erfolgreich validiert.', ?)
+        ) VALUES (?, ?, ?, ?, 1, ?, ?)
         ON CONFLICT(document_id) DO UPDATE SET
           profile=excluded.profile, pdf_filename=excluded.pdf_filename,
           xml_filename=excluded.xml_filename, xsd_valid=1,
           validation_message=excluded.validation_message,
           generated_at=excluded.generated_at
         """,
-        (document_id, result["profile"], pdf_filename, xml_filename, now),
+        (document_id, result["profile"], pdf_filename, xml_filename, validation_message, now),
     )
     Database.audit(
         connection, "document", document_id, "zugferd_generated", result["profile"]

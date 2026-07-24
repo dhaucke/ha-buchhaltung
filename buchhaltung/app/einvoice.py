@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+import os
+import subprocess
+import tempfile
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
+
+MUSTANG_CLI_JAR = os.environ.get("MUSTANG_CLI_JAR", "/opt/mustang/Mustang-CLI.jar")
 
 
 def decimal_text(cents: int) -> str:
@@ -85,6 +90,9 @@ def build_en16931_data(
             f"Zahlbar innerhalb {document.get('payment_terms_days', 0)} Tagen ohne Abzug."
         ),
         "BT-27": settings["company_name"],
+        # BR-CO-26 requires BT-29/30/31; Kleinunternehmer usually only have a
+        # Steuernummer (BT-32, schemeID FC), which doesn't satisfy that rule.
+        "BT-29": {None: settings["tax_number"]},
         "BT-32": settings["tax_number"],
         "BT-34": settings["email"],
         "BT-34-1": "EM",
@@ -162,6 +170,36 @@ def build_en16931_data(
     return data
 
 
+def validate_schematron(xml: bytes) -> dict:
+    """Validate EN 16931 business rules with the Mustang reference validator.
+
+    XSD validation only checks structure, not business rules (e.g. totals
+    matching the sum of line items). The Mustang-CLI jar runs both checks in
+    one offline Java process, so it's used here for the business-rule half.
+    Returns available=False when Java or the bundled jar aren't present
+    (e.g. local dev outside the Docker image) instead of failing outright.
+    """
+    if not Path(MUSTANG_CLI_JAR).is_file():
+        return {"available": False, "valid": None, "report": ""}
+    with tempfile.NamedTemporaryFile(suffix=".xml", delete=False) as handle:
+        handle.write(xml)
+        xml_path = handle.name
+    try:
+        result = subprocess.run(
+            ["java", "-jar", MUSTANG_CLI_JAR, "--action", "validate", "--source", xml_path],
+            capture_output=True, text=True, timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {"available": False, "valid": None, "report": str(exc)}
+    finally:
+        Path(xml_path).unlink(missing_ok=True)
+    return {
+        "available": True,
+        "valid": result.returncode == 0,
+        "report": (result.stdout or result.stderr).strip(),
+    }
+
+
 def create_zugferd(
     regular_pdf: Path,
     output_pdf: Path,
@@ -184,6 +222,12 @@ def create_zugferd(
         prefixed_namespaces=True,
     )
     xml_check_xsd(xml, flavor="factur-x", level="en16931")
+    schematron = validate_schematron(xml)
+    if schematron["available"] and not schematron["valid"]:
+        raise RuntimeError(
+            "XML ist XSD-valide, verletzt aber EN-16931-Geschäftsregeln "
+            "(Schematron-Prüfung durch Mustang):\n" + schematron["report"]
+        )
     output_xml.write_bytes(xml)
     generate_from_file(
         str(regular_pdf),
@@ -197,5 +241,7 @@ def create_zugferd(
     return {
         "profile": "ZUGFeRD / Factur-X EN 16931",
         "xsd_valid": True,
+        "schematron_checked": schematron["available"],
+        "schematron_valid": schematron["valid"],
         "xml_size": len(xml),
     }

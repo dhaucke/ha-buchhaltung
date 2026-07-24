@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.6.0
+
+- ZUGFeRD-/Factur-X-Rechnungen werden zusätzlich zur XML-Schema-Prüfung
+  gegen die EN-16931-Geschäftsregeln (Schematron) validiert – offline mit
+  dem offiziellen Mustang-Validator, kein externer Server nötig
+- dabei einen echten Validierungsfehler in der eigenen Rechnungserzeugung
+  gefunden und behoben (fehlende Verkäufer-Identifikation nach BR-CO-26)
+- das Add-on-Image enthält dafür jetzt eine schlanke Java-Laufzeitumgebung
+
 ## 0.5.11
 
 - nach dem Speichern einer Eingangsrechnung geht es automatisch zum

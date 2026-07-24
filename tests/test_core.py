@@ -16,7 +16,7 @@ APP_DIR = Path(__file__).resolve().parents[1] / "buchhaltung" / "app"
 sys.path.insert(0, str(APP_DIR))
 
 from db import Database, suggested_payment_date
-from einvoice import create_zugferd
+from einvoice import create_zugferd, validate_schematron
 from euer import create_euer_csv, create_euer_pdf, euer_entries, euer_summary
 from pdfgen import create_document_pdf
 from pdfimport import analyze_invoice_pdf
@@ -648,6 +648,16 @@ class CoreTests(unittest.TestCase):
             xml_check_xsd(embedded_xml, flavor="factur-x", level="en16931")
         )
         self.assertTrue(result["xsd_valid"])
+        schematron = validate_schematron(xml_output.read_bytes())
+        if schematron["available"]:
+            self.assertTrue(result["schematron_checked"])
+            self.assertTrue(
+                result["schematron_valid"],
+                f"Mustang-Schematron-Prüfung meldet EN-16931-Regelverstöße:\n{schematron['report']}",
+            )
+        else:
+            self.assertFalse(result["schematron_checked"])
+            self.assertIsNone(result["schematron_valid"])
 
 
 if __name__ == "__main__":
