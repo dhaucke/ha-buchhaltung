@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.6.4
+
+- neuer Button „Testmail senden“ auf der Microsoft-Einrichtungsseite prüft
+  den kompletten Mailversand über Graph, nicht nur die Zertifikatsanmeldung
+- Netzwerk- und Anmeldefehler von Microsoft Graph (z. B. falsche Tenant-ID,
+  nicht erreichbar) werden jetzt als verständliche Fehlermeldung angezeigt
+  statt als unbehandelter Serverfehler
+
 ## 0.6.3
 
 - Zertifikat für die Microsoft-Graph-Anmeldung kann jetzt direkt im Add-on

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import html
 import json
 import time
 import urllib.error
@@ -93,37 +94,46 @@ class GraphClient:
             data=body,
             headers={"Content-Type": "application/x-www-form-urlencoded"},
         )
-        with urllib.request.urlopen(request, timeout=20) as response:
-            return json.loads(response.read())["access_token"]
+        try:
+            with urllib.request.urlopen(request, timeout=20) as response:
+                return json.loads(response.read())["access_token"]
+        except urllib.error.HTTPError as exc:
+            details = exc.read().decode(errors="replace")
+            raise GraphConfigurationError(
+                f"Microsoft hat die Anmeldung abgelehnt ({exc.code}): {details[:500]}"
+            ) from exc
+        except urllib.error.URLError as exc:
+            raise GraphConfigurationError(
+                f"Microsoft Graph war nicht erreichbar: {exc.reason}"
+            ) from exc
 
     def test_authentication(self) -> None:
         """Validate certificate credentials without sending or reading mail."""
         self._token()
 
-    def send_pdf(
+    def send_mail(
         self,
         recipient: str,
         subject: str,
         body_html: str,
-        filename: str,
-        pdf_bytes: bytes,
+        filename: str | None = None,
+        pdf_bytes: bytes | None = None,
     ):
-        payload = {
-            "message": {
-                "subject": subject,
-                "body": {"contentType": "HTML", "content": body_html},
-                "toRecipients": [{"emailAddress": {"address": recipient}}],
-                "attachments": [
-                    {
-                        "@odata.type": "#microsoft.graph.fileAttachment",
-                        "name": filename,
-                        "contentType": "application/pdf",
-                        "contentBytes": base64.b64encode(pdf_bytes).decode(),
-                    }
-                ],
-            },
-            "saveToSentItems": True,
+        message = {
+            "subject": subject,
+            "body": {"contentType": "HTML", "content": body_html},
+            "toRecipients": [{"emailAddress": {"address": recipient}}],
         }
+        if filename and pdf_bytes is not None:
+            message["attachments"] = [
+                {
+                    "@odata.type": "#microsoft.graph.fileAttachment",
+                    "name": filename,
+                    "contentType": "application/pdf",
+                    "contentBytes": base64.b64encode(pdf_bytes).decode(),
+                }
+            ]
+        payload = {"message": message, "saveToSentItems": True}
         request = urllib.request.Request(
             f"https://graph.microsoft.com/v1.0/users/{urllib.parse.quote(self.sender)}/sendMail",
             data=json.dumps(payload).encode(),
@@ -139,3 +149,24 @@ class GraphClient:
         except urllib.error.HTTPError as exc:
             details = exc.read().decode(errors="replace")
             raise RuntimeError(f"Graph-Fehler {exc.code}: {details[:500]}") from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f"Microsoft Graph war nicht erreichbar: {exc.reason}") from exc
+
+    def send_pdf(
+        self,
+        recipient: str,
+        subject: str,
+        body_html: str,
+        filename: str,
+        pdf_bytes: bytes,
+    ):
+        return self.send_mail(recipient, subject, body_html, filename, pdf_bytes)
+
+    def send_test_email(self, recipient: str):
+        return self.send_mail(
+            recipient,
+            "Buchhaltung – Testmail",
+            "<p>Dies ist eine Testmail der Buchhaltung-App über Microsoft Graph.</p>"
+            f"<p>Gesendet als <b>{html.escape(self.sender)}</b>.</p>"
+            "<p>Wenn Sie diese Nachricht erhalten, funktioniert der Mailversand.</p>",
+        )

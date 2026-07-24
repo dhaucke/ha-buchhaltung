@@ -2237,6 +2237,10 @@ Test-ServicePrincipalAuthorization -Identity "{object_id or '<DIENSTPRINZIPAL-OB
       wird, wirkt diese additiv und hebt den engen Exchange-RBAC-Bereich praktisch auf.</p>
       <div class="form-actions"><a class="button" href="/settings">Zurück zu Einstellungen</a>
       {'<form method="post" action="/settings/microsoft/test"><button class="button primary">Zertifikatsanmeldung testen</button></form>' if graph_status else ''}</div>
+      {f'''<form class="form-actions" method="post" action="/settings/microsoft/send-test-email">
+      <input type="email" required name="test_recipient" value="{h(sender)}" placeholder="empfaenger@beispiel.de">
+      <button class="button primary">Testmail senden</button>
+      </form>''' if graph_status else ''}
     </div>"""
 
 
@@ -3229,6 +3233,17 @@ def application(environ, start_response):
                 return redirect(
                     start_response, "/settings/microsoft",
                     "Zertifikatsanmeldung bei Microsoft war erfolgreich.",
+                )
+            elif method == "POST" and path == "/settings/microsoft/send-test-email":
+                form = parse_form(environ)
+                recipient = str(form.get("test_recipient", "")).strip()
+                if not recipient:
+                    raise ValueError("Bitte eine Empfängeradresse für die Testmail angeben.")
+                GraphClient(DB.settings()).send_test_email(recipient)
+                Database.audit(connection, "settings", None, "graph_test_email_sent", recipient)
+                return redirect(
+                    start_response, "/settings/microsoft",
+                    f"Testmail wurde an {recipient} gesendet.",
                 )
             elif method == "POST" and path == "/settings/microsoft/generate-certificate":
                 generate_graph_certificate(DB.settings())
