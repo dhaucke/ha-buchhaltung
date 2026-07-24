@@ -14,7 +14,7 @@ import unicodedata
 import threading
 import time
 from io import BytesIO
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from email.parser import BytesParser
 from email.policy import default as email_policy
@@ -255,6 +255,47 @@ def save_graph_credentials(certificate, private_key) -> None:
                 raise ValueError(
                     f"Graph-Zertifikatsdateien sind ungültig: {exc}"
                 ) from exc
+
+
+def generate_graph_certificate(settings: dict[str, str]) -> None:
+    """Create a self-signed cert/key pair for Graph client-cert auth locally.
+
+    Avoids requiring the user to run openssl themselves: only the public
+    certificate needs to leave this machine (uploaded to Entra); the private
+    key is written straight to the persistent data directory.
+    """
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.x509.oid import NameOID
+
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    name = x509.Name([
+        x509.NameAttribute(NameOID.COMMON_NAME, settings.get("company_name") or "Buchhaltung"),
+    ])
+    now = datetime.now(timezone.utc)
+    certificate = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(private_key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - timedelta(minutes=5))
+        .not_valid_after(now + timedelta(days=730))
+        .sign(private_key, hashes.SHA256())
+    )
+    key_path = DATA_DIR / "graph-private-key.pem"
+    cert_path = DATA_DIR / "graph-certificate.pem"
+    key_path.write_bytes(
+        private_key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
+    )
+    key_path.chmod(0o600)
+    cert_path.write_bytes(certificate.public_bytes(serialization.Encoding.PEM))
+    cert_path.chmod(0o600)
 
 
 def company_logo_data_uri() -> str:
@@ -2124,6 +2165,13 @@ Test-ServicePrincipalAuthorization -Identity "{object_id or '<DIENSTPRINZIPAL-OB
         f'<label><span>{h(label)}</span><input name="{h(key)}" value="{h(settings.get(key, ""))}"></label>'
         for key, label in fields
     )
+    has_certificate = Path(settings.get("graph_certificate_path", "")).is_file()
+    generate_confirm = (
+        "Neues Zertifikat erstellen? Das alte Zertifikat in Entra funktioniert danach "
+        "nicht mehr und muss durch die neue Datei ersetzt werden."
+        if has_certificate else
+        "Zertifikat und privaten Schlüssel jetzt erstellen?"
+    )
     return f"""
     <div class="card form">
       <h2>Entra und Exchange Application RBAC</h2>
@@ -2134,8 +2182,10 @@ Test-ServicePrincipalAuthorization -Identity "{object_id or '<DIENSTPRINZIPAL-OB
         <a class="button" target="_blank" href="{h(app_registration_url)}">
         {'App-Registrierung öffnen' if client_id else 'App registrieren'}</a>
         Tenant-ID und Client-ID unten eintragen.</li>
-        <li><b>Zertifikat hochladen.</b> Den öffentlichen Anteil zusätzlich in der App-Registrierung
-        unter „Zertifikate &amp; Geheimnisse“ hinterlegen.</li>
+        <li><b>Zertifikat erstellen und hochladen.</b> Unten „Zertifikat erstellen“
+        verwenden, die heruntergeladene Datei in der App-Registrierung unter
+        „Zertifikate &amp; Geheimnisse“ hochladen. Der private Schlüssel verlässt dabei
+        nie dieses Gerät – es muss nichts mit z. B. OpenSSL selbst erzeugt werden.</li>
         <li><b>Dienstprinzipal-Objekt-ID ermitteln.</b>
         <a class="button" target="_blank" href="{h(enterprise_apps_url)}">Unternehmensanwendungen öffnen</a>
         dort nach der Client-ID suchen und die Objekt-ID der Anwendung übernehmen
@@ -2150,20 +2200,44 @@ Test-ServicePrincipalAuthorization -Identity "{object_id or '<DIENSTPRINZIPAL-OB
       Microsoft Graph: {h(status_text)}</span></div>
       <div class="form-grid">
       {inputs}
-      <label><span>Öffentliches Zertifikat (PEM)</span>
-      <input type="file" name="graph_certificate" accept=".pem,.crt"></label>
-      <label><span>Privater Schlüssel (PEM)</span>
-      <input type="file" name="graph_private_key" accept=".pem,.key"></label>
       </div>
-      <p class="notice">Der private Schlüssel wird nur im persistenten App-Datenverzeichnis
-      mit eingeschränkten Dateirechten gespeichert und gehört in ein verschlüsseltes Backup.</p>
+      <div class="form-actions"><button class="button primary">Speichern</button></div>
+    </form>
+    <div class="card form">
+      <h3>Zertifikat</h3>
+      <p class="muted">Empfohlen: Zertifikat und privaten Schlüssel hier erstellen lassen.
+      Der private Schlüssel bleibt dabei auf diesem Gerät; nur die heruntergeladene
+      Zertifikatsdatei wird bei Microsoft hochgeladen.</p>
+      <div class="form-actions">
+      <form method="post" action="/settings/microsoft/generate-certificate"
+            onsubmit="return confirm('{h(generate_confirm)}')">
+        <button class="button primary">Zertifikat erstellen</button>
+      </form>
+      {'<a class="button" href="/settings/microsoft/certificate.pem">Zertifikat herunterladen</a>' if has_certificate else ''}
+      </div>
+      <details>
+        <summary>Stattdessen eigenes Zertifikat hochladen</summary>
+        <form class="form" method="post" action="/settings" enctype="multipart/form-data">
+          <input type="hidden" name="return_to" value="/settings/microsoft">
+          <div class="form-grid">
+          <label><span>Öffentliches Zertifikat (PEM)</span>
+          <input type="file" name="graph_certificate" accept=".pem,.crt"></label>
+          <label><span>Privater Schlüssel (PEM)</span>
+          <input type="file" name="graph_private_key" accept=".pem,.key"></label>
+          </div>
+          <p class="notice">Der private Schlüssel wird nur im persistenten App-Datenverzeichnis
+          mit eingeschränkten Dateirechten gespeichert und gehört in ein verschlüsseltes Backup.</p>
+          <div class="form-actions"><button class="button">Hochladen</button></div>
+        </form>
+      </details>
+    </div>
+    <div class="card">
       <p class="notice"><b>Wichtig:</b> Wenn „Application Mail.Send“ zusätzlich als
       organisationsweite Graph-Anwendungsberechtigung mit Admin-Zustimmung in Entra vergeben
       wird, wirkt diese additiv und hebt den engen Exchange-RBAC-Bereich praktisch auf.</p>
       <div class="form-actions"><a class="button" href="/settings">Zurück zu Einstellungen</a>
-      <button class="button primary">Speichern</button></div>
-    </form>
-    {'<form method="post" action="/settings/microsoft/test"><button class="button primary">Zertifikatsanmeldung testen</button></form>' if graph_status else ''}"""
+      {'<form method="post" action="/settings/microsoft/test"><button class="button primary">Zertifikatsanmeldung testen</button></form>' if graph_status else ''}</div>
+    </div>"""
 
 
 class ThreadingWSGIServer(ThreadingMixIn, WSGIServer):
@@ -3155,6 +3229,24 @@ def application(environ, start_response):
                 return redirect(
                     start_response, "/settings/microsoft",
                     "Zertifikatsanmeldung bei Microsoft war erfolgreich.",
+                )
+            elif method == "POST" and path == "/settings/microsoft/generate-certificate":
+                generate_graph_certificate(DB.settings())
+                Database.audit(connection, "settings", None, "graph_certificate_generated")
+                return redirect(
+                    start_response, "/settings/microsoft",
+                    "Neues Zertifikat wurde erstellt. Jetzt herunterladen und bei "
+                    "Microsoft unter „Zertifikate & Geheimnisse“ hochladen.",
+                )
+            elif method == "GET" and path == "/settings/microsoft/certificate.pem":
+                cert_path = DATA_DIR / "graph-certificate.pem"
+                if not cert_path.is_file():
+                    raise ValueError("Es wurde noch kein Zertifikat erstellt.")
+                return response(
+                    start_response, cert_path.read_bytes(), content_type="application/x-pem-file",
+                    headers=[
+                        ("Content-Disposition", 'attachment; filename="buchhaltung-graph-certificate.pem"')
+                    ],
                 )
             elif method == "POST" and path == "/settings":
                 form = parse_form(environ)

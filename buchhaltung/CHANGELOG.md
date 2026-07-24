@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.6.3
+
+- Zertifikat für die Microsoft-Graph-Anmeldung kann jetzt direkt im Add-on
+  erstellt werden, statt es extern (z. B. mit OpenSSL) selbst erzeugen zu
+  müssen
+- der private Schlüssel verlässt dabei nie das Gerät; nur die
+  Zertifikatsdatei wird zum Hochladen bei Microsoft zum Download angeboten
+- manueller Upload eines eigenen Zertifikats bleibt als Alternative möglich
+
 ## 0.6.2
 
 - Microsoft-Graph-Einrichtung überarbeitet: alle Felder (Tenant-ID,
