@@ -184,6 +184,86 @@ class CoreTests(unittest.TestCase):
         self.assertIn("detected_amount_cents", columns)
         self.assertIn("customer_id", columns)
 
+    def test_archive_links_by_customer_number_despite_historical_address(self):
+        now = Database.now()
+        with self.db.connect() as connection:
+            customer_id = connection.execute(
+                """
+                INSERT INTO customers(
+                    customer_number, company, street, postal_code, city,
+                    created_at, updated_at
+                ) VALUES ('1002','Beispiel Logistik GmbH','Neuer Weg 9','10115',
+                          'Berlin',?,?)
+                """,
+                (now, now),
+            ).lastrowid
+            archive_id = connection.execute(
+                """
+                INSERT INTO archive_files(
+                    original_filename, stored_filename, sha256, mime_type,
+                    file_size, uploaded_at, document_direction,
+                    detected_customer_name, detected_customer_number,
+                    detected_street, detected_postal_code, detected_city
+                ) VALUES ('rechnung-2017.pdf','rechnung-2017.pdf','hash-2017',
+                          'application/pdf',123,?,'outgoing',
+                          'Beispiel Logistik GmbH','1002','Alte Straße 1','12345',
+                          'Musterstadt')
+                """,
+                (now,),
+            ).lastrowid
+
+            linked = Database.link_archives_by_customer_number(connection)
+            archive = connection.execute(
+                """
+                SELECT customer_id, detected_street, detected_postal_code,
+                       detected_city FROM archive_files WHERE id=?
+                """,
+                (archive_id,),
+            ).fetchone()
+
+        self.assertEqual(linked, 1)
+        self.assertEqual(archive["customer_id"], customer_id)
+        self.assertEqual(archive["detected_street"], "Alte Straße 1")
+        self.assertEqual(archive["detected_postal_code"], "12345")
+        self.assertEqual(archive["detected_city"], "Musterstadt")
+
+    def test_archive_does_not_link_by_name_or_address(self):
+        now = Database.now()
+        with self.db.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO customers(
+                    customer_number, company, street, postal_code, city,
+                    created_at, updated_at
+                ) VALUES ('1002','Beispiel Logistik GmbH','Alte Straße 1',
+                          '12345','Musterstadt',?,?)
+                """,
+                (now, now),
+            )
+            archive_id = connection.execute(
+                """
+                INSERT INTO archive_files(
+                    original_filename, stored_filename, sha256, mime_type,
+                    file_size, uploaded_at, document_direction,
+                    detected_customer_name, detected_customer_number,
+                    detected_street, detected_postal_code, detected_city
+                ) VALUES ('ohne-kundennummer.pdf','ohne-kundennummer.pdf',
+                          'hash-ohne-nummer','application/pdf',123,?,'outgoing',
+                          'Beispiel Logistik GmbH','','Alte Straße 1','12345',
+                          'Musterstadt')
+                """,
+                (now,),
+            ).lastrowid
+
+            linked = Database.link_archives_by_customer_number(connection)
+            customer_id = connection.execute(
+                "SELECT customer_id FROM archive_files WHERE id=?",
+                (archive_id,),
+            ).fetchone()["customer_id"]
+
+        self.assertEqual(linked, 0)
+        self.assertIsNone(customer_id)
+
     def test_recurring_invoice_schema_exists(self):
         with self.db.connect() as connection:
             tables = {

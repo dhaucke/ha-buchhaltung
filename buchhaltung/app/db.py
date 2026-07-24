@@ -326,6 +326,7 @@ class Database:
                     connection.execute(
                         f"ALTER TABLE documents ADD COLUMN {column} {definition}"
                     )
+            self.link_archives_by_customer_number(connection)
 
     def settings(self) -> dict[str, str]:
         with self.connect() as connection:
@@ -365,3 +366,56 @@ class Database:
             """,
             (entity_type, entity_id, action, details, cls.now()),
         )
+
+    @classmethod
+    def link_archives_by_customer_number(
+        cls,
+        connection: sqlite3.Connection,
+        archive_id: int | None = None,
+    ) -> int:
+        """Link outgoing archive PDFs to one unambiguous customer number.
+
+        Customer addresses deliberately do not participate in this lookup:
+        an imported invoice keeps its historical address while the customer
+        record may contain the current address.
+        """
+        parameters: tuple[object, ...] = ()
+        archive_filter = ""
+        if archive_id is not None:
+            archive_filter = "AND a.id=?"
+            parameters = (archive_id,)
+        candidates = connection.execute(
+            f"""
+            SELECT a.id AS archive_id, MIN(c.id) AS customer_id
+            FROM archive_files a
+            JOIN customers c
+              ON lower(trim(c.customer_number))
+               = lower(trim(a.detected_customer_number))
+            WHERE a.customer_id IS NULL
+              AND a.document_direction='outgoing'
+              AND trim(a.detected_customer_number)!=''
+              {archive_filter}
+            GROUP BY a.id
+            HAVING count(c.id)=1
+            """,
+            parameters,
+        ).fetchall()
+        linked = 0
+        for candidate in candidates:
+            result = connection.execute(
+                """
+                UPDATE archive_files SET customer_id=?
+                WHERE id=? AND customer_id IS NULL
+                """,
+                (candidate["customer_id"], candidate["archive_id"]),
+            )
+            if result.rowcount:
+                linked += 1
+                cls.audit(
+                    connection,
+                    "archive",
+                    candidate["archive_id"],
+                    "customer_auto_linked_by_number",
+                    str(candidate["customer_id"]),
+                )
+        return linked

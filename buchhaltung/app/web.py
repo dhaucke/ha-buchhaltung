@@ -1629,6 +1629,7 @@ def update_archive_analysis(connection, archive_id: int, result: dict):
             archive_id,
         ),
     )
+    Database.link_archives_by_customer_number(connection, archive_id)
 
 
 def incoming_page(connection) -> str:
@@ -1981,6 +1982,7 @@ def application(environ, start_response):
                 )
                 connection.execute("UPDATE settings SET value=? WHERE key='customer_counter'", (str(number),))
                 Database.audit(connection, "customer", cursor.lastrowid, "created", str(number))
+                Database.link_archives_by_customer_number(connection)
                 return redirect(start_response, "/customers", f"Kunde {form['company']} wurde angelegt.")
             elif method == "GET" and re.fullmatch(r"/customer/\d+", path):
                 customer_id = int(path.split("/")[2])
@@ -2464,7 +2466,13 @@ def application(environ, start_response):
                     ),
                 )
                 Database.audit(connection, "archive", archive_id, "metadata_corrected")
-                return redirect(start_response, f"/archive/{archive_id}", "Korrekturen wurden gespeichert.")
+                linked = Database.link_archives_by_customer_number(connection, archive_id)
+                message = (
+                    "Korrekturen wurden gespeichert und der Beleg wurde über die "
+                    "Kundennummer mit dem bestehenden Kunden verknüpft."
+                    if linked else "Korrekturen wurden gespeichert."
+                )
+                return redirect(start_response, f"/archive/{archive_id}", message)
             elif method == "POST" and re.fullmatch(r"/archive/\d+/payment", path):
                 archive_id = int(path.split("/")[2])
                 item = connection.execute(

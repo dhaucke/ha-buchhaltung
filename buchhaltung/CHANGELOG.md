@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.5.1
+
+- bereits importierte Ausgangsrechnungen werden rückwirkend über die erkannte
+  Kundennummer mit dem bestehenden Kunden verknüpft
+- geänderte Kundenanschriften verhindern die Zuordnung historischer Belege nicht
+- die alte Rechnungsanschrift bleibt unverändert am importierten PDF erhalten
+- erneute PDF-Analyse und manuelle Korrektur der Kundennummer lösen die
+  Verknüpfung unmittelbar aus
+
 ## 0.5.0
 
 - beliebig viele Positionen in Angeboten, Aufträgen, Rechnungen und

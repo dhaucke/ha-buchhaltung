@@ -6,7 +6,7 @@ EÜR-Arbeitsunterlage. Sämtliche Firmendaten und das
 Unternehmenslogo werden erst bei der Ersteinrichtung eingegeben und
 ausschließlich im persistenten Datenverzeichnis gespeichert.
 
-## Stand 0.5.0
+## Stand 0.5.1
 
 - neutraler Ersteinrichtungs-Assistent ohne fest eingebaute Firmendaten
 - eigenes Logo als PNG, JPG oder WebP
@@ -29,6 +29,8 @@ ausschließlich im persistenten Datenverzeichnis gespeichert.
 - getrennte Verarbeitung von Ausgangs- und Eingangsrechnungen
 - Original-PDFs direkt im Archiv öffnen
 - Rechnungsnummer, Datum, Betrag, Kundennummer und Kundenanschrift auslesen
+- historische Rechnungen anhand der Kundennummer mit der Kundenakte verknüpfen,
+  ohne die damalige Rechnungsanschrift durch die aktuelle Anschrift zu ersetzen
 - Lieferanten- und Eingangsrechnungsverwaltung
 - EÜR-Kategorien, betrieblicher Anteil und frei wählbares Zahlungsdatum
 - EÜR-Jahresauswertung als Bildschirmansicht, PDF und CSV
