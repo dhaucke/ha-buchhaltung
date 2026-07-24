@@ -1468,16 +1468,46 @@ def recurring_worker():
         time.sleep(3600)
 
 
-def archive_page(connection) -> str:
+def archive_filters_from_query(query: dict) -> dict[str, str]:
+    return {
+        "customer": str(query.get("customer", [""])[0]).strip(),
+        "customer_number": str(query.get("customer_number", [""])[0]).strip(),
+    }
+
+
+def archive_filter_suffix(filters: dict[str, str]) -> str:
+    values = {key: value for key, value in filters.items() if value}
+    return "?" + urllib.parse.urlencode(values) if values else ""
+
+
+def archive_page(connection, filters: dict[str, str] | None = None) -> str:
+    filters = filters or {"customer": "", "customer_number": ""}
+    conditions, parameters = [], []
+    if filters["customer"]:
+        pattern = f"%{filters['customer'].lower()}%"
+        conditions.append(
+            "(lower(a.detected_customer_name) LIKE ? "
+            "OR lower(COALESCE(c.company,'')) LIKE ?)"
+        )
+        parameters.extend((pattern, pattern))
+    if filters["customer_number"]:
+        pattern = f"%{filters['customer_number'].lower()}%"
+        conditions.append(
+            "(lower(a.detected_customer_number) LIKE ? "
+            "OR lower(COALESCE(c.customer_number,'')) LIKE ?)"
+        )
+        parameters.extend((pattern, pattern))
+    where = "WHERE " + " AND ".join(conditions) if conditions else ""
     files = rows(
         connection,
-        """
+        f"""
         SELECT a.*, d.document_number, c.company AS imported_customer,
                i.id AS incoming_invoice_id
         FROM archive_files a
         LEFT JOIN customers c ON c.id=a.customer_id
         LEFT JOIN documents d ON d.id=a.document_id
         LEFT JOIN incoming_invoices i ON i.archive_file_id=a.id
+        {where}
         ORDER BY
           CASE WHEN trim(a.detected_invoice_number)='' THEN 1 ELSE 0 END,
           a.detected_invoice_number COLLATE NOCASE DESC,
@@ -1485,10 +1515,13 @@ def archive_page(connection) -> str:
           a.uploaded_at DESC,
           a.id DESC
         """,
+        tuple(parameters),
     )
+    filter_suffix = archive_filter_suffix(filters)
+    escaped_suffix = h(filter_suffix)
     open_files = [file for file in files if not file["reviewed_at"]]
     continue_button = (
-        f'<a class="button primary" href="/archive/{open_files[0]["id"]}">'
+        f'<a class="button primary" href="/archive/{open_files[0]["id"]}{escaped_suffix}">'
         f'Prüfung fortsetzen · {len(open_files)} offen</a>'
         if open_files else
         '<span class="status paid">Alle importierten Belege geprüft</span>'
@@ -1503,7 +1536,7 @@ def archive_page(connection) -> str:
         f"<td class='money'>{money(f['detected_amount_cents']) if f['detected_amount_cents'] is not None else '–'}</td>"
         f"<td><span class='status {'paid' if f['reviewed_at'] else ''}'>"
         f"{'Geprüft' if f['reviewed_at'] else 'Offen'}</span></td>"
-        f"<td><div class='row-actions'><a class='button compact' href='/archive/{f['id']}'>Prüfen</a>"
+        f"<td><div class='row-actions'><a class='button compact' href='/archive/{f['id']}{escaped_suffix}'>Prüfen</a>"
         f"<a class='button compact' target='_blank' href='/archive/{f['id']}/pdf'>Öffnen</a>"
         f"<form method='post' action='/archive/{f['id']}/analyze'><button class='button compact'>Neu analysieren</button></form>"
         + (
@@ -1515,9 +1548,30 @@ def archive_page(connection) -> str:
         )
         + f"</div></td></tr>"
         for f in files
-    ) or '<tr><td colspan="7" class="empty">Noch keine alten Rechnungen importiert.</td></tr>'
+    ) or (
+        '<tr><td colspan="7" class="empty">Keine passenden Archivbelege gefunden.</td></tr>'
+        if filters["customer"] or filters["customer_number"] else
+        '<tr><td colspan="7" class="empty">Noch keine alten Rechnungen importiert.</td></tr>'
+    )
     return f"""
     <div class="actions">{continue_button}</div>
+    <form class="card form" method="get" action="/archive">
+      <h2>Archiv filtern</h2>
+      <div class="form-grid">
+        <label><span>Kunde / Unternehmen</span>
+          <input name="customer" value="{h(filters['customer'])}"
+                 placeholder="z. B. Muster GmbH">
+        </label>
+        <label><span>Kundennummer</span>
+          <input name="customer_number" value="{h(filters['customer_number'])}"
+                 placeholder="z. B. 1002">
+        </label>
+      </div>
+      <div class="form-actions">
+        <a class="button" href="/archive">Filter zurücksetzen</a>
+        <button class="button primary">Filtern · {len(files)} Treffer</button>
+      </div>
+    </form>
     <div class="card form">
       <h2>PDF-Belege importieren</h2>
       <p class="muted">Bis zu 50 PDFs gemeinsam auswählen. Die Originaldateien bleiben
@@ -1539,7 +1593,14 @@ def archive_page(connection) -> str:
     <tbody>{file_rows}</tbody></table></div></div>"""
 
 
-def archive_detail(connection, archive_id: int) -> str:
+def archive_detail(
+    connection,
+    archive_id: int,
+    filters: dict[str, str] | None = None,
+) -> str:
+    filters = filters or {"customer": "", "customer_number": ""}
+    filter_suffix = archive_filter_suffix(filters)
+    escaped_suffix = h(filter_suffix)
     item = connection.execute(
         """
         SELECT a.*, c.company AS imported_customer, c.customer_number,
@@ -1553,22 +1614,20 @@ def archive_detail(connection, archive_id: int) -> str:
     if not item:
         raise ValueError("Archivdatei wurde nicht gefunden.")
     next_id = Database.next_unreviewed_archive_id(
-        connection, archive_id, item["document_direction"]
+        connection,
+        archive_id,
+        item["document_direction"],
+        filters["customer"],
+        filters["customer_number"],
     )
-    open_count = connection.execute(
-        """
-        SELECT count(*) FROM archive_files
-        WHERE document_direction=? AND reviewed_at IS NULL
-        """,
-        (item["document_direction"],),
-    ).fetchone()[0]
     queue_state = (
         f'<span class="status paid">Geprüft</span>'
         if item["reviewed_at"] else
-        f'<span class="status">{open_count} Belege offen</span>'
+        '<span class="status">Offen</span>'
     )
     next_button = (
-        f'<a class="button" href="/archive/{next_id}">Nächster offener Beleg</a>'
+        f'<a class="button" href="/archive/{next_id}{escaped_suffix}">'
+        f'Nächster offener Beleg</a>'
         if next_id else ""
     )
     amount_value = (
@@ -1615,7 +1674,8 @@ def archive_detail(connection, archive_id: int) -> str:
             item["detected_issue_date"], terms
         )
         payment_form = f"""
-        <form class="card form" method="post" action="/archive/{archive_id}/payment">
+        <form class="card form" method="post"
+              action="/archive/{archive_id}/payment{escaped_suffix}">
           <h2>Zahlung für EÜR</h2>
           <p class="muted">Historische Ausgangsrechnungen werden erst mit einem
           Zahlungsdatum als Betriebseinnahme berücksichtigt.</p>
@@ -1649,7 +1709,8 @@ def archive_detail(connection, archive_id: int) -> str:
       <form method="post" action="/archive/{archive_id}/analyze"><button class="button">Neu analysieren</button></form>
       {incoming_button}{delete_button}
     </div>
-    <form class="card form" method="post" action="/archive/{archive_id}/metadata">
+    <form class="card form" method="post"
+          action="/archive/{archive_id}/metadata{escaped_suffix}">
       <h2>Erkannte Daten prüfen</h2>
       <p class="muted">Korrigiere die Felder bei Bedarf, bevor du den Kunden übernimmst.</p>
       <div class="form-grid">
@@ -2393,10 +2454,20 @@ def application(environ, start_response):
                     "Zahlungserinnerung wurde über Microsoft Graph versendet.",
                 )
             elif method == "GET" and path == "/archive":
-                body, title, active = archive_page(connection), "Dokumentenarchiv", "archive"
+                filters = archive_filters_from_query(query)
+                body, title, active = (
+                    archive_page(connection, filters),
+                    "Dokumentenarchiv",
+                    "archive",
+                )
             elif method == "GET" and re.fullmatch(r"/archive/\d+", path):
                 archive_id = int(path.split("/")[2])
-                body, title, active = archive_detail(connection, archive_id), "PDF-Import prüfen", "archive"
+                filters = archive_filters_from_query(query)
+                body, title, active = (
+                    archive_detail(connection, archive_id, filters),
+                    "PDF-Import prüfen",
+                    "archive",
+                )
             elif method == "GET" and re.fullmatch(r"/archive/\d+/pdf", path):
                 archive_id = int(path.split("/")[2])
                 item = connection.execute(
@@ -2546,6 +2617,8 @@ def application(environ, start_response):
                 )
             elif method == "POST" and re.fullmatch(r"/archive/\d+/metadata", path):
                 archive_id = int(path.split("/")[2])
+                filters = archive_filters_from_query(query)
+                filter_suffix = archive_filter_suffix(filters)
                 form = parse_form(environ)
                 connection.execute(
                     """
@@ -2576,12 +2649,16 @@ def application(environ, start_response):
                     )
                     Database.audit(connection, "archive", archive_id, "reviewed")
                     next_id = Database.next_unreviewed_archive_id(
-                        connection, archive_id
+                        connection,
+                        archive_id,
+                        None,
+                        filters["customer"],
+                        filters["customer_number"],
                     )
                     if next_id:
                         return redirect(
                             start_response,
-                            f"/archive/{next_id}",
+                            f"/archive/{next_id}{filter_suffix}",
                             f"{message} Nächster offener Beleg wurde geladen.",
                         )
                     return redirect(
@@ -2592,6 +2669,8 @@ def application(environ, start_response):
                 return redirect(start_response, f"/archive/{archive_id}", message)
             elif method == "POST" and re.fullmatch(r"/archive/\d+/payment", path):
                 archive_id = int(path.split("/")[2])
+                filters = archive_filters_from_query(query)
+                filter_suffix = archive_filter_suffix(filters)
                 item = connection.execute(
                     "SELECT document_direction, detected_amount_cents FROM archive_files WHERE id=?",
                     (archive_id,),
@@ -2632,12 +2711,16 @@ def application(environ, start_response):
                         connection, "archive", archive_id, "reviewed_after_accounting"
                     )
                     next_id = Database.next_unreviewed_archive_id(
-                        connection, archive_id
+                        connection,
+                        archive_id,
+                        None,
+                        filters["customer"],
+                        filters["customer_number"],
                     )
                     if next_id:
                         return redirect(
                             start_response,
-                            f"/archive/{next_id}",
+                            f"/archive/{next_id}{filter_suffix}",
                             "Zahlungsstatus wurde gespeichert. "
                             "Nächster offener Beleg wurde geladen.",
                         )

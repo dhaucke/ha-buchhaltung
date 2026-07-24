@@ -382,6 +382,52 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(outgoing_next, newest_id)
         self.assertEqual(incoming_next, incoming_id)
 
+    def test_review_queue_can_filter_by_customer_and_number(self):
+        now = Database.now()
+        with self.db.connect() as connection:
+            customer_id = connection.execute(
+                """
+                INSERT INTO customers(
+                    customer_number, company, street, postal_code, city,
+                    created_at, updated_at
+                ) VALUES ('1002','Beispiel Logistik GmbH','','','',?,?)
+                """,
+                (now, now),
+            ).lastrowid
+            matching_id = connection.execute(
+                """
+                INSERT INTO archive_files(
+                    customer_id, original_filename, stored_filename, sha256,
+                    mime_type, file_size, uploaded_at, document_direction,
+                    detected_invoice_number
+                ) VALUES (?,'passend.pdf','passend.pdf','filter-match',
+                          'application/pdf',123,?,'outgoing','2026-07-0133')
+                """,
+                (customer_id, now),
+            ).lastrowid
+            connection.execute(
+                """
+                INSERT INTO archive_files(
+                    original_filename, stored_filename, sha256, mime_type,
+                    file_size, uploaded_at, document_direction,
+                    detected_invoice_number, detected_customer_name,
+                    detected_customer_number
+                ) VALUES ('andere.pdf','andere.pdf','filter-other',
+                          'application/pdf',123,?,'outgoing','2026-08-0134',
+                          'Andere GmbH','2000')
+                """,
+                (now,),
+            )
+            result = Database.next_unreviewed_archive_id(
+                connection,
+                None,
+                "outgoing",
+                "logistik",
+                "002",
+            )
+
+        self.assertEqual(result, matching_id)
+
     def test_recurring_invoice_schema_exists(self):
         with self.db.connect() as connection:
             tables = {

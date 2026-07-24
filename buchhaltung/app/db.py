@@ -510,6 +510,8 @@ class Database:
         connection: sqlite3.Connection,
         current_id: int | None = None,
         direction: str | None = None,
+        customer_search: str = "",
+        customer_number_search: str = "",
     ) -> int | None:
         if current_id is not None and direction is None:
             current = connection.execute(
@@ -517,24 +519,39 @@ class Database:
                 (current_id,),
             ).fetchone()
             direction = current["document_direction"] if current else None
-        conditions = ["reviewed_at IS NULL"]
+        conditions = ["a.reviewed_at IS NULL"]
         parameters: list[object] = []
         if current_id is not None:
-            conditions.append("id!=?")
+            conditions.append("a.id!=?")
             parameters.append(current_id)
         if direction in ("outgoing", "incoming"):
-            conditions.append("document_direction=?")
+            conditions.append("a.document_direction=?")
             parameters.append(direction)
+        if customer_search.strip():
+            pattern = f"%{customer_search.strip().lower()}%"
+            conditions.append(
+                "(lower(a.detected_customer_name) LIKE ? "
+                "OR lower(COALESCE(c.company,'')) LIKE ?)"
+            )
+            parameters.extend((pattern, pattern))
+        if customer_number_search.strip():
+            pattern = f"%{customer_number_search.strip().lower()}%"
+            conditions.append(
+                "(lower(a.detected_customer_number) LIKE ? "
+                "OR lower(COALESCE(c.customer_number,'')) LIKE ?)"
+            )
+            parameters.extend((pattern, pattern))
         row = connection.execute(
             f"""
-            SELECT id FROM archive_files
+            SELECT a.id FROM archive_files a
+            LEFT JOIN customers c ON c.id=a.customer_id
             WHERE {' AND '.join(conditions)}
             ORDER BY
-              CASE WHEN trim(detected_invoice_number)='' THEN 1 ELSE 0 END,
-              detected_invoice_number COLLATE NOCASE DESC,
-              detected_issue_date DESC,
-              uploaded_at DESC,
-              id DESC
+              CASE WHEN trim(a.detected_invoice_number)='' THEN 1 ELSE 0 END,
+              a.detected_invoice_number COLLATE NOCASE DESC,
+              a.detected_issue_date DESC,
+              a.uploaded_at DESC,
+              a.id DESC
             LIMIT 1
             """,
             tuple(parameters),

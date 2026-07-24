@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.5.6
+
+- Archiv kann nach Kunden- bzw. Unternehmensname gefiltert werden
+- zusätzlicher Teiltextfilter für Kundennummern
+- Filter berücksichtigen erkannte PDF-Daten und verknüpfte Kundenstammdaten
+- Filter bleiben beim fortlaufenden Prüfen und Verbuchen erhalten
+- Anzahl der Treffer und der darin noch offenen Belege wird angezeigt
+
 ## 0.5.5
 
 - Archivliste wird nach Rechnungsnummer absteigend sortiert
