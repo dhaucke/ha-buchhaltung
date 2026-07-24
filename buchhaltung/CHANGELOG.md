@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.4.1
+
+- ungebuchte PDF-Fehlimporte können auch dann gelöscht werden, wenn bereits ein
+  Kunde mit dem Archivbeleg verknüpft wurde
+- Löschschutz greift weiterhin bei gebuchten Eingangsrechnungen und fest
+  zugeordneten Dokumenten
+
 ## 0.4.0
 
 - Massenimport für bis zu 50 PDF-Belege pro Durchlauf

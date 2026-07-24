@@ -98,6 +98,15 @@ def uploaded_files(value) -> list[UploadedFile]:
     return [item for item in values if isinstance(item, UploadedFile) and item.filename]
 
 
+def archive_can_be_deleted(item) -> bool:
+    """Ungebuchte Fehlimporte dürfen auch nach einer Kundenverknüpfung weg."""
+    return (
+        not item["document_id"]
+        and not item["incoming_invoice_id"]
+        and item["accounting_status"] == "unbooked"
+    )
+
+
 def cents(value: str) -> int:
     normalized = value.strip().replace(".", "").replace(",", ".")
     try:
@@ -923,8 +932,7 @@ def archive_page(connection) -> str:
             f"<form method='post' action='/archive/{f['id']}/delete' "
             f"onsubmit=\"return confirm('Fehlimport und PDF endgültig löschen?')\">"
             f"<button class='button compact danger'>Löschen</button></form>"
-            if not f["document_id"] and not f["incoming_invoice_id"]
-            and f["accounting_status"] == "unbooked" and not f["customer_id"]
+            if archive_can_be_deleted(f)
             else ""
         )
         + f"</div></td></tr>"
@@ -999,8 +1007,7 @@ def archive_detail(connection, archive_id: int) -> str:
         f'<form method="post" action="/archive/{archive_id}/delete" '
         f'onsubmit="return confirm(\'Fehlimport und PDF endgültig löschen?\')">'
         f'<button class="button danger">Fehlimport löschen</button></form>'
-        if not item["customer_id"] and not item["incoming_invoice_id"]
-        and not item["document_id"] and item["accounting_status"] == "unbooked"
+        if archive_can_be_deleted(item)
         else ""
     )
     payment_form = ""
@@ -1819,12 +1826,10 @@ def application(environ, start_response):
                 ).fetchone()
                 if not item:
                     raise ValueError("Archivdatei wurde nicht gefunden.")
-                if (
-                    item["document_id"] or item["customer_id"] or item["incoming_invoice_id"]
-                    or item["accounting_status"] != "unbooked"
-                ):
+                if not archive_can_be_deleted(item):
                     raise ValueError(
-                        "Der Beleg ist bereits zugeordnet oder gebucht und darf nicht gelöscht werden."
+                        "Der Beleg ist bereits gebucht oder einem Dokument zugeordnet "
+                        "und darf deshalb nicht gelöscht werden."
                     )
                 target = DATA_DIR / "archive" / item["stored_filename"]
                 Database.audit(

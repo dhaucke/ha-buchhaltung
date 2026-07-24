@@ -6,7 +6,7 @@ EÜR-Arbeitsunterlage. Sämtliche Firmendaten und das
 Unternehmenslogo werden erst bei der Ersteinrichtung eingegeben und
 ausschließlich im persistenten Datenverzeichnis gespeichert.
 
-## Stand 0.4.0
+## Stand 0.4.1
 
 - neutraler Ersteinrichtungs-Assistent ohne fest eingebaute Firmendaten
 - eigenes Logo als PNG, JPG oder WebP
