@@ -341,22 +341,32 @@ def layout(title: str, body: str, active: str = "") -> str:
         if settings.get("small_business_enabled", "1") == "1"
         else "Rechnungsverwaltung"
     )
-    nav = [
-        ("/", "dashboard", "Übersicht"),
-        ("/customers", "customers", "Kunden"),
-        ("/documents?type=offer", "offer", "Angebote"),
-        ("/documents?type=order", "order", "Aufträge"),
-        ("/documents?type=invoice", "invoice", "Rechnungen"),
-        ("/documents?type=credit", "credit", "Gutschriften"),
-        ("/reminders", "reminders", "Zahlungserinnerungen"),
-        ("/incoming", "incoming", "Eingangsrechnungen"),
-        ("/archive", "archive", "Archiv"),
-        ("/reports/euer", "reports", "EÜR"),
-        ("/settings", "settings", "Einstellungen"),
+    nav_groups = [
+        (None, [("/", "dashboard", "Übersicht")]),
+        ("Verkauf", [
+            ("/customers", "customers", "Kunden"),
+            ("/documents?type=offer", "offer", "Angebote"),
+            ("/documents?type=order", "order", "Aufträge"),
+            ("/documents?type=invoice", "invoice", "Rechnungen"),
+            ("/documents?type=credit", "credit", "Gutschriften"),
+            ("/reminders", "reminders", "Zahlungserinnerungen"),
+        ]),
+        ("Einkauf", [
+            ("/incoming", "incoming", "Eingangsrechnungen"),
+            ("/archive", "archive", "Archiv"),
+        ]),
+        ("Auswertung", [
+            ("/reports/euer", "reports", "EÜR"),
+        ]),
+        (None, [("/settings", "settings", "Einstellungen")]),
     ]
     links = "".join(
-        f'<a class="{"active" if key == active else ""}" href="{url}">{label}</a>'
-        for url, key, label in nav
+        (f'<div class="nav-group-label">{h(group)}</div>' if group else "")
+        + "".join(
+            f'<a class="{"active" if key == active else ""}" href="{url}">{label}</a>'
+            for url, key, label in items
+        )
+        for group, items in nav_groups
     )
     return f"""<!doctype html>
 <html lang="de">
@@ -2111,37 +2121,60 @@ def euer_page(connection, year: int) -> str:
     Entnahmen und steuerlich beschränkte Ausgaben sind gesondert zu prüfen.</div>"""
 
 
+def settings_tabs(active: str) -> str:
+    tabs = [
+        ("/settings", "unternehmen", "Unternehmen"),
+        ("/settings/rechnungswesen", "rechnungswesen", "Rechnungswesen"),
+        ("/settings/nummernkreise", "nummernkreise", "Nummernkreise"),
+        ("/settings/microsoft", "microsoft", "Microsoft"),
+    ]
+    links = "".join(
+        f'<a class="{"active" if key == active else ""}" href="{url}">{label}</a>'
+        for url, key, label in tabs
+    )
+    return f'<div class="settings-tabs">{links}</div>'
+
+
 def settings_page(settings: dict[str, str]) -> str:
     fields = [
         ("company_name", "Unternehmensname"), ("owner_name", "Inhaber"), ("street", "Straße"),
         ("postal_code", "PLZ"), ("city", "Ort"), ("country", "Land"),
         ("phone", "Telefon"), ("email", "E-Mail"),
         ("website", "Website"), ("tax_number", "Steuernummer"), ("iban", "IBAN"), ("bic", "BIC"),
-        ("bank_name", "Bank"), ("payment_terms_days", "Zahlungsziel in Tagen"),
+        ("bank_name", "Bank"),
     ]
     inputs = "".join(
         f'<label><span>{h(label)}</span><input name="{h(key)}" value="{h(settings.get(key, ""))}"></label>'
         for key, label in fields
     )
-    graph_status = GraphClient(settings).configured()
     logo_data_uri = company_logo_data_uri()
     logo_preview = (
         f'<img class="setup-logo-preview" src="{logo_data_uri}" alt="Aktuelles Logo">'
         if logo_data_uri else
         '<div class="setup-logo-empty">Noch kein Logo hinterlegt</div>'
     )
-    checked = "checked" if settings.get("small_business_enabled", "1") == "1" else ""
     return f"""
-    <div class="card">
-      <div class="settings-status"><span class="status {'paid' if graph_status else 'draft'}">
-      Microsoft Graph: {'eingerichtet' if graph_status else 'noch nicht vollständig'}</span></div>
-      <div class="form-actions"><a class="button" href="/settings/microsoft">Microsoft-Einrichtung öffnen</a></div>
-    </div>
+    {settings_tabs("unternehmen")}
     <form class="card form" method="post" action="/settings" enctype="multipart/form-data">
+      <input type="hidden" name="return_to" value="/settings">
       <div class="form-grid">
       <label class="wide"><span>Unternehmenslogo</span>{logo_preview}
       <input type="file" name="logo" accept="image/png,image/jpeg,image/webp"></label>
       {inputs}
+      </div>
+      <div class="form-actions"><button class="button primary">Einstellungen speichern</button></div>
+    </form>"""
+
+
+def settings_billing_page(settings: dict[str, str]) -> str:
+    checked = "checked" if settings.get("small_business_enabled", "1") == "1" else ""
+    return f"""
+    {settings_tabs("rechnungswesen")}
+    <form class="card form" method="post" action="/settings" enctype="multipart/form-data">
+      <input type="hidden" name="return_to" value="/settings/rechnungswesen">
+      <div class="form-grid">
+      <label><span>Zahlungsziel in Tagen</span>
+      <input name="payment_terms_days" value="{h(settings.get('payment_terms_days', ''))}"></label>
       <label class="check wide"><input type="checkbox" name="small_business_enabled" {checked}>
       <span>Kleinunternehmerregelung nach § 19 UStG verwenden</span></label>
       <label class="wide"><span>Kleinunternehmer-Hinweis</span>
@@ -2152,9 +2185,13 @@ def settings_page(settings: dict[str, str]) -> str:
       Leerzeile = neuer Absatz.</small></label>
       </div>
       <div class="form-actions"><button class="button primary">Einstellungen speichern</button></div>
-    </form>
+    </form>"""
+
+
+def settings_numbers_page(settings: dict[str, str]) -> str:
+    return f"""
+    {settings_tabs("nummernkreise")}
     <form class="card form" method="post" action="/settings/counters">
-      <h3>Nummernkreise korrigieren</h3>
       <p class="muted">Zählerstand vor dem nächsten neu erzeugten Dokument dieser Art.
       Beispiel: Wird bei Rechnungen 132 eingetragen, erhält die nächste Rechnung die
       laufende Nummer 0133. Nur ändern, wenn ein Zähler durch einen Fehler
@@ -2227,6 +2264,7 @@ Test-ServicePrincipalAuthorization -Identity "{object_id or '<DIENSTPRINZIPAL-OB
         "Zertifikat und privaten Schlüssel jetzt erstellen?"
     )
     return f"""
+    {settings_tabs("microsoft")}
     <div class="card form">
       <h2>Entra und Exchange Application RBAC</h2>
       <p>Diese Variante beschränkt die Anwendung in Exchange auf genau das eingetragene
@@ -2289,7 +2327,7 @@ Test-ServicePrincipalAuthorization -Identity "{object_id or '<DIENSTPRINZIPAL-OB
       <p class="notice"><b>Wichtig:</b> Wenn „Application Mail.Send“ zusätzlich als
       organisationsweite Graph-Anwendungsberechtigung mit Admin-Zustimmung in Entra vergeben
       wird, wirkt diese additiv und hebt den engen Exchange-RBAC-Bereich praktisch auf.</p>
-      <div class="form-actions"><a class="button" href="/settings">Zurück zu Einstellungen</a>
+      <div class="form-actions">
       {'<form method="post" action="/settings/microsoft/test"><button class="button primary">Zertifikatsanmeldung testen</button></form>' if graph_status else ''}</div>
       {f'''<form class="form-actions" method="post" action="/settings/microsoft/send-test-email">
       <input type="email" required name="test_recipient" value="{h(sender)}" placeholder="empfaenger@beispiel.de">
@@ -3276,6 +3314,14 @@ def application(environ, start_response):
                 )
             elif method == "GET" and path == "/settings":
                 body, title, active = settings_page(DB.settings()), "Einstellungen", "settings"
+            elif method == "GET" and path == "/settings/rechnungswesen":
+                body, title, active = (
+                    settings_billing_page(DB.settings()), "Rechnungswesen", "settings",
+                )
+            elif method == "GET" and path == "/settings/nummernkreise":
+                body, title, active = (
+                    settings_numbers_page(DB.settings()), "Nummernkreise", "settings",
+                )
             elif method == "GET" and path == "/settings/microsoft":
                 body, title, active = (
                     microsoft_setup_page(DB.settings()),
@@ -3333,9 +3379,10 @@ def application(environ, start_response):
                     for key, value in form.items()
                     if key in allowed and not isinstance(value, UploadedFile)
                 }
-                values["small_business_enabled"] = (
-                    "1" if form.get("small_business_enabled") == "on" else "0"
-                )
+                if form.get("return_to") == "/settings/rechnungswesen":
+                    values["small_business_enabled"] = (
+                        "1" if form.get("small_business_enabled") == "on" else "0"
+                    )
                 if "payment_terms_days" in values:
                     try:
                         terms = int(values["payment_terms_days"])
@@ -3344,10 +3391,12 @@ def application(environ, start_response):
                     if not 0 <= terms <= 365:
                         raise ValueError("Das Zahlungsziel muss zwischen 0 und 365 Tagen liegen.")
                 DB.update_settings(values)
-                return_to = (
-                    "/settings/microsoft" if form.get("return_to") == "/settings/microsoft"
-                    else "/settings"
-                )
+                return_to = form.get("return_to")
+                if return_to not in (
+                    "/settings", "/settings/rechnungswesen",
+                    "/settings/nummernkreise", "/settings/microsoft",
+                ):
+                    return_to = "/settings"
                 return redirect(start_response, return_to, "Einstellungen wurden gespeichert.")
             elif method == "POST" and path == "/settings/counters":
                 form = parse_form(environ)
@@ -3363,7 +3412,7 @@ def application(environ, start_response):
                     connection, "settings", None, "counters_corrected",
                     ", ".join(f"{key}={value}" for key, value in counters.items()),
                 )
-                return redirect(start_response, "/settings", "Zähler wurden gespeichert.")
+                return redirect(start_response, "/settings/nummernkreise", "Zähler wurden gespeichert.")
             else:
                 return response(start_response, layout("Nicht gefunden", "<div class='alert error'>Seite nicht gefunden.</div>"), 404)
     except (ValueError, sqlite3.Error, RuntimeError) as exc:

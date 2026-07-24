@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.6.9
+
+- Hauptmenü ist jetzt nach Verkauf, Einkauf und Auswertung gruppiert statt
+  einer langen flachen Liste
+- Einstellungen sind in vier Unterseiten mit Reiter-Navigation aufgeteilt:
+  Unternehmen, Rechnungswesen, Nummernkreise, Microsoft – statt einer
+  einzigen überladenen Seite
+
 ## 0.6.8
 
 - E-Mail-Text beim Versenden von Rechnungen/Gutschriften ist jetzt in den
