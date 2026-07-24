@@ -419,3 +419,67 @@ class Database:
                     str(candidate["customer_id"]),
                 )
         return linked
+
+    @staticmethod
+    def find_semantic_archive_duplicate(
+        connection: sqlite3.Connection,
+        direction: str,
+        invoice_number: str,
+        party_name: str = "",
+        issue_date: str = "",
+        amount_cents: int | None = None,
+    ):
+        """Find the same business document even when the PDF bytes differ."""
+        invoice_number = invoice_number.strip()
+        if not invoice_number:
+            return None
+        if direction == "outgoing":
+            duplicate = connection.execute(
+                """
+                SELECT id, 'archive' AS source
+                FROM archive_files
+                WHERE document_direction='outgoing'
+                  AND lower(trim(detected_invoice_number))=lower(trim(?))
+                ORDER BY id LIMIT 1
+                """,
+                (invoice_number,),
+            ).fetchone()
+            if duplicate:
+                return duplicate
+            return connection.execute(
+                """
+                SELECT id, 'document' AS source
+                FROM documents
+                WHERE lower(trim(document_number))=lower(trim(?))
+                ORDER BY id LIMIT 1
+                """,
+                (invoice_number,),
+            ).fetchone()
+
+        party_name = party_name.strip()
+        if party_name:
+            return connection.execute(
+                """
+                SELECT id, 'archive' AS source
+                FROM archive_files
+                WHERE document_direction='incoming'
+                  AND lower(trim(detected_invoice_number))=lower(trim(?))
+                  AND lower(trim(detected_customer_name))=lower(trim(?))
+                ORDER BY id LIMIT 1
+                """,
+                (invoice_number, party_name),
+            ).fetchone()
+        if issue_date and amount_cents is not None:
+            return connection.execute(
+                """
+                SELECT id, 'archive' AS source
+                FROM archive_files
+                WHERE document_direction='incoming'
+                  AND lower(trim(detected_invoice_number))=lower(trim(?))
+                  AND detected_issue_date=?
+                  AND detected_amount_cents=?
+                ORDER BY id LIMIT 1
+                """,
+                (invoice_number, issue_date, amount_cents),
+            ).fetchone()
+        return None

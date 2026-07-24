@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.5.2
+
+- PDF-Import erkennt weiterhin identische Dateien über ihre SHA-256-Prüfsumme
+- zusätzliche inhaltliche Dublettenprüfung für technisch unterschiedliche PDFs
+  derselben Rechnung
+- Ausgangsrechnungen werden anhand der eindeutigen Rechnungsnummer geprüft
+- bei Eingangsrechnungen werden Rechnungsnummer und erkannter Lieferant
+  gemeinsam verglichen
+- der Massenimport nennt Anzahl und Dateinamen der übersprungenen Dubletten
+
 ## 0.5.1
 
 - bereits importierte Ausgangsrechnungen werden rückwirkend über die erkannte

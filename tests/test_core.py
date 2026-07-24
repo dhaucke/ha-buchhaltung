@@ -264,6 +264,56 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(linked, 0)
         self.assertIsNone(customer_id)
 
+    def test_outgoing_duplicate_is_found_by_invoice_number(self):
+        now = Database.now()
+        with self.db.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO archive_files(
+                    original_filename, stored_filename, sha256, mime_type,
+                    file_size, uploaded_at, document_direction,
+                    detected_invoice_number, detected_customer_name
+                ) VALUES ('original.pdf','original.pdf','first-hash',
+                          'application/pdf',123,?,'outgoing',
+                          '2026-07-0133','Beispiel GmbH')
+                """,
+                (now,),
+            )
+            duplicate = Database.find_semantic_archive_duplicate(
+                connection,
+                "outgoing",
+                " 2026-07-0133 ",
+                "Anderer erkannter Name",
+            )
+
+        self.assertIsNotNone(duplicate)
+        self.assertEqual(duplicate["source"], "archive")
+
+    def test_incoming_duplicate_requires_matching_supplier(self):
+        now = Database.now()
+        with self.db.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO archive_files(
+                    original_filename, stored_filename, sha256, mime_type,
+                    file_size, uploaded_at, document_direction,
+                    detected_invoice_number, detected_customer_name
+                ) VALUES ('lieferant-a.pdf','lieferant-a.pdf','supplier-a-hash',
+                          'application/pdf',123,?,'incoming',
+                          'RE-100','Lieferant A GmbH')
+                """,
+                (now,),
+            )
+            same_supplier = Database.find_semantic_archive_duplicate(
+                connection, "incoming", "RE-100", "lieferant a gmbh"
+            )
+            other_supplier = Database.find_semantic_archive_duplicate(
+                connection, "incoming", "RE-100", "Lieferant B GmbH"
+            )
+
+        self.assertIsNotNone(same_supplier)
+        self.assertIsNone(other_supplier)
+
     def test_recurring_invoice_schema_exists(self):
         with self.db.connect() as connection:
             tables = {

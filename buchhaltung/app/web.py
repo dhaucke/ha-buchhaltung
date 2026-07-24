@@ -2363,7 +2363,8 @@ def application(environ, start_response):
                 direction = form.get("document_direction", "outgoing")
                 if direction not in ("outgoing", "incoming"):
                     raise ValueError("Ungültige Belegart.")
-                created_ids, duplicates, invalid = [], 0, 0
+                created_ids, file_duplicates, document_duplicates, invalid = [], 0, 0, 0
+                duplicate_names = []
                 for index, upload in enumerate(uploads):
                     raw = upload.data
                     if len(raw) > 20 * 1024 * 1024 or not raw.startswith(b"%PDF-"):
@@ -2374,7 +2375,36 @@ def application(environ, start_response):
                         "SELECT id FROM archive_files WHERE sha256=? ORDER BY id LIMIT 1", (digest,)
                     ).fetchone()
                     if existing:
-                        duplicates += 1
+                        file_duplicates += 1
+                        duplicate_names.append(Path(upload.filename).name)
+                        continue
+                    result = analyze_invoice_pdf(raw, upload.filename, DB.settings())
+                    if len(uploads) == 1:
+                        if form.get("document_number"):
+                            result["invoice_number"] = str(form["document_number"]).strip()
+                        if form.get("issue_date"):
+                            result["issue_date"] = str(form["issue_date"])
+                        if form.get("amount"):
+                            result["amount_cents"] = cents(str(form["amount"]))
+                    semantic_duplicate = Database.find_semantic_archive_duplicate(
+                        connection,
+                        direction,
+                        result["invoice_number"],
+                        result["customer_name"],
+                        result["issue_date"],
+                        result["amount_cents"],
+                    )
+                    if semantic_duplicate:
+                        document_duplicates += 1
+                        duplicate_names.append(Path(upload.filename).name)
+                        Database.audit(
+                            connection,
+                            "archive_import",
+                            None,
+                            "semantic_duplicate_skipped",
+                            f"{direction}: {upload.filename}; "
+                            f"{semantic_duplicate['source']}:{semantic_duplicate['id']}",
+                        )
                         continue
                     safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", Path(upload.filename).name)
                     stored_name = (
@@ -2399,23 +2429,24 @@ def application(environ, start_response):
                     except Exception:
                         target.unlink(missing_ok=True)
                         raise
-                    result = analyze_invoice_pdf(raw, upload.filename, DB.settings())
-                    if len(uploads) == 1:
-                        if form.get("document_number"):
-                            result["invoice_number"] = str(form["document_number"]).strip()
-                        if form.get("issue_date"):
-                            result["issue_date"] = str(form["issue_date"])
-                        if form.get("amount"):
-                            result["amount_cents"] = cents(str(form["amount"]))
                     update_archive_analysis(connection, archive_id, result)
                     Database.audit(
                         connection, "archive", archive_id, "uploaded_and_analyzed",
                         f"{direction}: {upload.filename}",
                     )
                     created_ids.append(archive_id)
+                duplicate_total = file_duplicates + document_duplicates
+                duplicate_detail = (
+                    " Betroffen: "
+                    + ", ".join(duplicate_names[:5])
+                    + (" …" if len(duplicate_names) > 5 else "")
+                    if duplicate_names else ""
+                )
                 if not created_ids:
                     raise ValueError(
-                        f"Keine neue PDF importiert ({duplicates} Duplikate, {invalid} ungültige/zu große Dateien)."
+                        f"Keine neue PDF importiert ({file_duplicates} identische Dateien, "
+                        f"{document_duplicates} bereits vorhandene Rechnungen, "
+                        f"{invalid} ungültige/zu große Dateien).{duplicate_detail}"
                     )
                 if len(created_ids) == 1 and len(uploads) == 1:
                     return redirect(
@@ -2425,7 +2456,10 @@ def application(environ, start_response):
                 return redirect(
                     start_response, "/archive",
                     f"Massenimport abgeschlossen: {len(created_ids)} importiert, "
-                    f"{duplicates} Duplikate übersprungen, {invalid} ungültig/zu groß.",
+                    f"{duplicate_total} Dubletten übersprungen "
+                    f"({file_duplicates} identische Dateien, "
+                    f"{document_duplicates} gleiche Rechnungen), "
+                    f"{invalid} ungültig/zu groß.{duplicate_detail}",
                     "error" if invalid else "success",
                 )
             elif method == "POST" and re.fullmatch(r"/archive/\d+/analyze", path):
