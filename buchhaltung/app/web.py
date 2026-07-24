@@ -533,6 +533,15 @@ def rows(connection, query: str, params=()):
     return [dict(row) for row in connection.execute(query, params)]
 
 
+def list_toggle(base_url: str, total: int, show_all: bool, limit: int = 20) -> str:
+    if total <= limit:
+        return ""
+    separator = "&" if "?" in base_url else "?"
+    if show_all:
+        return f'<a class="button compact" href="{base_url}">Nur die letzten {limit} anzeigen</a>'
+    return f'<a class="button compact" href="{base_url}{separator}all=1">Alle {total} anzeigen</a>'
+
+
 def fetch_document(connection, document_id: int):
     row = connection.execute(
         """
@@ -622,7 +631,7 @@ def dashboard(connection) -> str:
     """
 
 
-def customers_page(connection) -> str:
+def customers_page(connection, search: str = "") -> str:
     customers = rows(
         connection,
         """
@@ -632,6 +641,15 @@ def customers_page(connection) -> str:
         FROM customers c ORDER BY c.company
         """,
     )
+    if search:
+        needle = search.strip().lower()
+        customers = [
+            c for c in customers
+            if needle in (c["company"] or "").lower()
+            or needle in (c["customer_number"] or "").lower()
+            or needle in (c["contact_name"] or "").lower()
+            or needle in (c["email"] or "").lower()
+        ]
     customer_rows = "".join(
         f"""<tr><td><a href="/customer/{c['id']}"><strong>{h(c['customer_number'])}</strong></a></td>
         <td><a href="/customer/{c['id']}">{h(c['company'])}</a></td>
@@ -639,9 +657,25 @@ def customers_page(connection) -> str:
         <td>{c['current_count'] + c['archive_count']}</td>
         <td><a class="button compact" href="/customer/{c['id']}">Kundenakte</a></td></tr>"""
         for c in customers
-    ) or '<tr><td colspan="6" class="empty">Noch keine Kunden angelegt.</td></tr>'
+    ) or (
+        '<tr><td colspan="6" class="empty">Keine passenden Kunden gefunden.</td></tr>'
+        if search else
+        '<tr><td colspan="6" class="empty">Noch keine Kunden angelegt.</td></tr>'
+    )
     return f"""
     <div class="actions"><a class="button primary" href="/customer/new">Kunde anlegen</a></div>
+    <form class="card form" method="get" action="/customers">
+      <div class="form-grid">
+        <label class="wide"><span>Suche</span>
+          <input type="search" name="q" value="{h(search)}"
+                 placeholder="Name, Kundennummer, Ansprechpartner oder E-Mail">
+        </label>
+      </div>
+      <div class="form-actions">
+        <a class="button" href="/customers">Filter zurücksetzen</a>
+        <button class="button primary">Filtern · {len(customers)} Treffer</button>
+      </div>
+    </form>
     <div class="card"><div class="table-wrap"><table><thead><tr><th>Kundennummer</th><th>Unternehmen</th>
     <th>Ansprechpartner</th><th>Rechnungs-E-Mail</th><th>Dokumente</th><th></th></tr></thead>
     <tbody>{customer_rows}</tbody></table></div></div>"""
@@ -716,15 +750,9 @@ def customer_detail(connection, customer_id: int, show_all_documents: bool = Fal
     document_rows = "".join(html for _, html in visible_entries)
     if not document_rows:
         document_rows = '<tr><td colspan="5" class="empty">Noch keine Dokumente für diesen Kunden.</td></tr>'
-    documents_toggle = ""
-    if total_entries > document_limit:
-        documents_toggle = (
-            f'<a class="button compact" href="/customer/{customer_id}">'
-            f'Nur die letzten {document_limit} anzeigen</a>'
-            if show_all_documents else
-            f'<a class="button compact" href="/customer/{customer_id}?all=1">'
-            f'Alle {total_entries} anzeigen</a>'
-        )
+    documents_toggle = list_toggle(
+        f"/customer/{customer_id}", total_entries, show_all_documents, document_limit
+    )
 
     templates = rows(
         connection,
@@ -747,7 +775,10 @@ def customer_detail(connection, customer_id: int, show_all_documents: bool = Fal
         <form method="post" action="/recurring/{r['id']}/run">
         <button class="button compact">Jetzt erzeugen</button></form>
         <form method="post" action="/recurring/{r['id']}/toggle">
-        <button class="button compact">{'Pausieren' if r['active'] else 'Aktivieren'}</button></form></div></td></tr>"""
+        <button class="button compact">{'Pausieren' if r['active'] else 'Aktivieren'}</button></form>
+        <form method="post" action="/recurring/{r['id']}/delete"
+        onsubmit="return confirm('Diese Dauerrechnung endgültig löschen? Bereits erzeugte Rechnungen bleiben erhalten.')">
+        <button class="button compact danger">Löschen</button></form></div></td></tr>"""
         for r in templates
     ) or '<tr><td colspan="6" class="empty">Noch keine monatliche Rechnung eingerichtet.</td></tr>'
     email_note = (
@@ -773,7 +804,7 @@ def customer_detail(connection, customer_id: int, show_all_documents: bool = Fal
     <tbody>{template_rows}</tbody></table></div></div>"""
 
 
-def documents_page(connection, doc_type: str) -> str:
+def documents_page(connection, doc_type: str, show_all: bool = False) -> str:
     if doc_type not in TYPE_LABELS:
         doc_type = "invoice"
     documents = rows(
@@ -784,12 +815,14 @@ def documents_page(connection, doc_type: str) -> str:
         """,
         (doc_type,),
     )
+    total = len(documents)
+    visible = documents if show_all else documents[:20]
     document_rows = "".join(
         f"""<tr><td><a href="/document/{d['id']}">{h(d['document_number'] or 'Entwurf')}</a></td>
         <td>{german_date(d['issue_date'])}</td><td>{h(d['company'])}</td>
         <td>{h(d['title'])}</td><td class="money">{money(d['total_cents'])}</td>
         <td><span class="status {h(d['status'])}">{h(DOCUMENT_STATUS.get(d['status'], d['status']))}</span></td></tr>"""
-        for d in documents
+        for d in visible
     ) or f'<tr><td colspan="6" class="empty">Noch keine {h(TYPE_LABELS[doc_type])}-Dokumente vorhanden.</td></tr>'
     create_action = (
         '<div class="alert">Eine Gutschrift wird direkt aus der zugehörigen Rechnung '
@@ -798,9 +831,11 @@ def documents_page(connection, doc_type: str) -> str:
         else f"""<div class="actions"><a class="button primary" href="/document/new?type={doc_type}">
         {h(TYPE_LABELS[doc_type])} erstellen</a></div>"""
     )
+    toggle = list_toggle(f"/documents?type={doc_type}", total, show_all)
     return f"""
     {create_action}
-    <div class="card"><div class="table-wrap"><table><thead><tr><th>Nummer</th><th>Datum</th>
+    <div class="card"><div class="card-head split-head"><h2>{h(TYPE_LABELS[doc_type])}</h2>{toggle}</div>
+    <div class="table-wrap"><table><thead><tr><th>Nummer</th><th>Datum</th>
     <th>Kunde</th><th>Betreff</th><th>Betrag</th><th>Status</th></tr></thead>
     <tbody>{document_rows}</tbody></table></div></div>"""
 
@@ -1122,18 +1157,7 @@ def document_detail(connection, document_id: int) -> str:
     if document["status"] != "draft":
         actions.append(f'<a class="button" href="/document/{document_id}/pdf">PDF öffnen</a>')
         if document["status"] in ("final", "sent") and document["customer_email"]:
-            if electronic and electronic["xsd_valid"]:
-                actions.append(f"""
-                <form class="payment-action" method="post" action="/document/{document_id}/send">
-                  <select name="format">
-                    <option value="auto">Automatisch (ZUGFeRD bevorzugt)</option>
-                    <option value="zugferd">ZUGFeRD-PDF</option>
-                    <option value="pdf">Normales PDF</option>
-                  </select>
-                  <button class="button">Per E-Mail senden</button>
-                </form>""")
-            else:
-                actions.append(f'<form method="post" action="/document/{document_id}/send"><button class="button">Per E-Mail senden</button></form>')
+            actions.append(f'<a class="button" href="/document/{document_id}/send">Per E-Mail senden</a>')
     if (
         document["document_type"] in ("invoice", "credit")
         and document["status"] not in ("draft", "cancelled")
@@ -1452,14 +1476,7 @@ def recurring_form(connection, customer_id: int, template=None) -> str:
     </form>"""
 
 
-def send_document_email(connection, document_id: int, pdf_format: str = "auto"):
-    document = fetch_document(connection, document_id)
-    if not document or document["status"] not in ("final", "sent"):
-        raise ValueError("Nur fertiggestellte Dokumente können versendet werden.")
-    if not document["customer_email"]:
-        raise ValueError("Beim Kunden ist keine Rechnungs-E-Mail hinterlegt.")
-    pdf = resolve_document_pdf(connection, document_id, pdf_format)
-    settings = DB.settings()
+def build_document_email_text(document: dict, settings: dict[str, str]) -> tuple[str, str]:
     company_name = settings.get("company_name", "")
     closing_name = settings.get("owner_name") or company_name
     subject = (
@@ -1479,6 +1496,53 @@ def send_document_email(connection, document_id: int, pdf_format: str = "auto"):
         raise ValueError(
             f"Der E-Mail-Text in den Einstellungen enthält einen unbekannten Platzhalter: {exc}"
         ) from exc
+    return subject, message
+
+
+def document_send_form(connection, document_id: int) -> str:
+    document = fetch_document(connection, document_id)
+    if not document or document["status"] not in ("final", "sent"):
+        raise ValueError("Nur fertiggestellte Dokumente können versendet werden.")
+    if not document["customer_email"]:
+        raise ValueError("Beim Kunden ist keine Rechnungs-E-Mail hinterlegt.")
+    subject, message = build_document_email_text(document, DB.settings())
+    electronic = connection.execute(
+        "SELECT * FROM e_invoice_files WHERE document_id=? AND xsd_valid=1", (document_id,)
+    ).fetchone()
+    format_field = (
+        f"""<label><span>Versandformat</span><select name="format">
+        <option value="auto">Automatisch (ZUGFeRD bevorzugt)</option>
+        <option value="zugferd">ZUGFeRD-PDF</option>
+        <option value="pdf">Normales PDF</option>
+        </select></label>"""
+        if electronic else ""
+    )
+    return f"""
+    <form class="card form" method="post" action="/document/{document_id}/send">
+      <div class="alert">Empfänger: {h(document['customer_email'])}</div>
+      <div class="form-grid">
+        <label class="wide"><span>Betreff *</span><input required name="subject" value="{h(subject)}"></label>
+        <label class="wide"><span>Nachricht *</span><textarea class="reminder-message" required name="message">{h(message)}</textarea></label>
+        {format_field}
+      </div>
+      <div class="form-actions"><a class="button" href="/document/{document_id}">Abbrechen</a>
+      <button class="button primary">Jetzt per E-Mail senden</button></div>
+    </form>"""
+
+
+def send_document_email(
+    connection, document_id: int, pdf_format: str = "auto",
+    subject: str | None = None, message: str | None = None,
+) -> None:
+    document = fetch_document(connection, document_id)
+    if not document or document["status"] not in ("final", "sent"):
+        raise ValueError("Nur fertiggestellte Dokumente können versendet werden.")
+    if not document["customer_email"]:
+        raise ValueError("Beim Kunden ist keine Rechnungs-E-Mail hinterlegt.")
+    pdf = resolve_document_pdf(connection, document_id, pdf_format)
+    settings = DB.settings()
+    if subject is None or message is None:
+        subject, message = build_document_email_text(document, settings)
     body_html = "<p>" + h(message).replace("\n\n", "</p><p>").replace("\n", "<br>") + "</p>"
     status = GraphClient(settings).send_pdf(
         document["customer_email"], subject, body_html, pdf.name, pdf.read_bytes()
@@ -1987,7 +2051,7 @@ def link_or_create_customer(connection, archive_id: int) -> tuple[int, str]:
     return customer_id, message
 
 
-def incoming_page(connection) -> str:
+def incoming_page(connection, show_all: bool = False) -> str:
     invoices = rows(
         connection,
         """
@@ -1999,6 +2063,8 @@ def incoming_page(connection) -> str:
         ORDER BY i.invoice_date DESC, i.id DESC
         """,
     )
+    total = len(invoices)
+    visible = invoices if show_all else invoices[:20]
     status_labels = {
         "draft": "Entwurf", "booked": "Gebucht", "paid": "Bezahlt", "cancelled": "Storniert"
     }
@@ -2008,14 +2074,15 @@ def incoming_page(connection) -> str:
         <td>{german_date(item['payment_date']) if item['payment_date'] else '–'}</td>
         <td>{h(item['eur_category'])}</td><td class="money">{money(item['deductible_cents'])}</td>
         <td><span class="status {h(item['status'])}">{h(status_labels[item['status']])}</span></td></tr>"""
-        for item in invoices
+        for item in visible
     ) or '<tr><td colspan="7" class="empty">Noch keine Eingangsrechnungen erfasst.</td></tr>'
+    toggle = list_toggle("/incoming", total, show_all)
     return f"""
     <div class="actions"><a class="button primary" href="/archive">PDFs importieren</a></div>
     <div class="card">
-      <div class="card-head"><h2>Eingangsrechnungen</h2>
+      <div class="card-head split-head"><div><h2>Eingangsrechnungen</h2>
       <p class="muted">Belege werden zuerst im Archiv importiert und anschließend hier
-      als Ausgabe gebucht. Für die EÜR ist das Zahlungsdatum maßgeblich.</p></div>
+      als Ausgabe gebucht. Für die EÜR ist das Zahlungsdatum maßgeblich.</p></div>{toggle}</div>
       <div class="table-wrap"><table><thead><tr><th>Rechnungsnummer</th><th>Lieferant</th>
       <th>Rechnungsdatum</th><th>Bezahlt am</th><th>EÜR-Kategorie</th>
       <th>Abziehbarer Betrag</th><th>Status</th></tr></thead><tbody>{invoice_rows}</tbody></table></div>
@@ -2199,6 +2266,7 @@ def settings_tabs(active: str) -> str:
         ("/settings/rechnungswesen", "rechnungswesen", "Rechnungswesen"),
         ("/settings/nummernkreise", "nummernkreise", "Nummernkreise"),
         ("/settings/microsoft", "microsoft", "Microsoft"),
+        ("/settings/protokoll", "protokoll", "Protokoll"),
     ]
     links = "".join(
         f'<a class="{"active" if key == active else ""}" href="{url}">{label}</a>'
@@ -2284,6 +2352,73 @@ def settings_numbers_page(settings: dict[str, str]) -> str:
       </div>
       <div class="form-actions"><button class="button primary">Zähler speichern</button></div>
     </form>"""
+
+
+AUDIT_ENTITY_LABELS = {
+    "archive": "Archiv",
+    "customer": "Kunde",
+    "document": "Dokument",
+    "incoming_invoice": "Eingangsrechnung",
+    "recurring_invoice": "Dauerrechnung",
+    "settings": "Einstellungen",
+}
+
+
+def german_datetime(value: str) -> str:
+    try:
+        return datetime.fromisoformat(value).strftime("%d.%m.%Y %H:%M")
+    except (TypeError, ValueError):
+        return value or ""
+
+
+def audit_page(connection, entity_type: str = "", show_all: bool = False) -> str:
+    conditions, params = [], []
+    if entity_type:
+        conditions.append("entity_type=?")
+        params.append(entity_type)
+    where = "WHERE " + " AND ".join(conditions) if conditions else ""
+    entries = rows(
+        connection,
+        f"SELECT * FROM audit_log {where} ORDER BY id DESC",
+        tuple(params),
+    )
+    total = len(entries)
+    limit = 50
+    visible = entries if show_all else entries[:limit]
+    entry_rows = "".join(
+        f"""<tr><td>{german_datetime(e['created_at'])}</td>
+        <td>{h(AUDIT_ENTITY_LABELS.get(e['entity_type'], e['entity_type']))}</td>
+        <td>{e['entity_id'] if e['entity_id'] is not None else '–'}</td>
+        <td>{h(e['action'])}</td><td>{h(e['details'])}</td></tr>"""
+        for e in visible
+    ) or (
+        '<tr><td colspan="5" class="empty">Keine passenden Protokolleinträge gefunden.</td></tr>'
+        if entity_type else
+        '<tr><td colspan="5" class="empty">Noch keine Protokolleinträge.</td></tr>'
+    )
+    type_options = "".join(
+        f'<option value="{key}" {"selected" if key == entity_type else ""}>{label}</option>'
+        for key, label in AUDIT_ENTITY_LABELS.items()
+    )
+    base_url = f"/settings/protokoll?type={entity_type}" if entity_type else "/settings/protokoll"
+    toggle = list_toggle(base_url, total, show_all, limit)
+    return f"""
+    {settings_tabs("protokoll")}
+    <form class="card form" method="get" action="/settings/protokoll">
+      <div class="form-grid">
+        <label><span>Bereich</span><select name="type">
+          <option value="">Alle</option>
+          {type_options}
+        </select></label>
+      </div>
+      <div class="form-actions">
+        <a class="button" href="/settings/protokoll">Filter zurücksetzen</a>
+        <button class="button primary">Filtern · {total} Treffer</button>
+      </div>
+    </form>
+    <div class="card"><div class="card-head split-head"><h2>Protokoll</h2>{toggle}</div>
+    <div class="table-wrap"><table><thead><tr><th>Zeitpunkt</th><th>Bereich</th><th>ID</th>
+    <th>Aktion</th><th>Details</th></tr></thead><tbody>{entry_rows}</tbody></table></div></div>"""
 
 
 def microsoft_setup_page(settings: dict[str, str]) -> str:
@@ -2509,7 +2644,8 @@ def application(environ, start_response):
             if method == "GET" and path == "/":
                 body, title, active = dashboard(connection), "Übersicht", "dashboard"
             elif method == "GET" and path == "/customers":
-                body, title, active = customers_page(connection), "Kunden", "customers"
+                search = query.get("q", [""])[0]
+                body, title, active = customers_page(connection, search), "Kunden", "customers"
             elif method == "GET" and path == "/customer/new":
                 body, title, active = customer_form(), "Neuer Kunde", "customers"
             elif method == "POST" and path == "/customer/new":
@@ -2652,6 +2788,19 @@ def application(environ, start_response):
                     (0 if template["active"] else 1, Database.now(), recurring_id),
                 )
                 return redirect(start_response, f"/customer/{template['customer_id']}", "Status wurde geändert.")
+            elif method == "POST" and re.fullmatch(r"/recurring/\d+/delete", path):
+                recurring_id = int(path.split("/")[2])
+                template = connection.execute(
+                    "SELECT customer_id FROM recurring_invoices WHERE id=?", (recurring_id,)
+                ).fetchone()
+                if not template:
+                    raise ValueError("Dauerrechnung wurde nicht gefunden.")
+                connection.execute("DELETE FROM recurring_invoices WHERE id=?", (recurring_id,))
+                Database.audit(connection, "recurring_invoice", recurring_id, "deleted")
+                return redirect(
+                    start_response, f"/customer/{template['customer_id']}",
+                    "Dauerrechnung wurde gelöscht.",
+                )
             elif method == "POST" and re.fullmatch(r"/recurring/\d+/run", path):
                 recurring_id = int(path.split("/")[2])
                 template = connection.execute(
@@ -2675,7 +2824,11 @@ def application(environ, start_response):
                 )
             elif method == "GET" and path == "/documents":
                 doc_type = query.get("type", ["invoice"])[0]
-                body, title, active = documents_page(connection, doc_type), TYPE_LABELS.get(doc_type, "Rechnungen"), doc_type
+                show_all = query.get("all", ["0"])[0] == "1"
+                body, title, active = (
+                    documents_page(connection, doc_type, show_all),
+                    TYPE_LABELS.get(doc_type, "Rechnungen"), doc_type,
+                )
             elif method == "GET" and path == "/document/new":
                 doc_type = query.get("type", ["invoice"])[0]
                 source_id = int(query["source"][0]) if query.get("source") else None
@@ -2904,13 +3057,22 @@ def application(environ, start_response):
                 if target not in ("order", "invoice"):
                     raise ValueError("Ungültiger Dokumenttyp.")
                 return redirect(start_response, f"/document/new?type={target}&source={source_id}")
+            elif method == "GET" and re.fullmatch(r"/document/\d+/send", path):
+                document_id = int(path.split("/")[2])
+                body, title, active = (
+                    document_send_form(connection, document_id), "E-Mail versenden", "invoice",
+                )
             elif method == "POST" and re.fullmatch(r"/document/\d+/send", path):
                 document_id = int(path.split("/")[2])
                 form = parse_form(environ)
                 pdf_format = str(form.get("format", "auto")).strip()
                 if pdf_format not in ("auto", "pdf", "zugferd"):
                     raise ValueError("Ungültiges Versandformat.")
-                send_document_email(connection, document_id, pdf_format)
+                subject = str(form.get("subject", "")).strip()
+                message = str(form.get("message", "")).strip()
+                if not subject or not message:
+                    raise ValueError("Betreff und Nachricht dürfen nicht leer sein.")
+                send_document_email(connection, document_id, pdf_format, subject, message)
                 return redirect(start_response, f"/document/{document_id}", "E-Mail wurde über Microsoft Graph versendet.")
             elif method == "GET" and path == "/reminders":
                 body, title, active = (
@@ -3288,7 +3450,8 @@ def application(environ, start_response):
                     "Eingangsrechnung wurde als Entwurf angelegt. Bitte Daten prüfen.",
                 )
             elif method == "GET" and path == "/incoming":
-                body, title, active = incoming_page(connection), "Eingangsrechnungen", "incoming"
+                show_all = query.get("all", ["0"])[0] == "1"
+                body, title, active = incoming_page(connection, show_all), "Eingangsrechnungen", "incoming"
             elif method == "GET" and re.fullmatch(r"/incoming/\d+", path):
                 incoming_id = int(path.split("/")[2])
                 body, title, active = incoming_detail(connection, incoming_id), "Eingangsrechnung prüfen", "incoming"
@@ -3450,6 +3613,12 @@ def application(environ, start_response):
             elif method == "GET" and path == "/settings/nummernkreise":
                 body, title, active = (
                     settings_numbers_page(DB.settings()), "Nummernkreise", "settings",
+                )
+            elif method == "GET" and path == "/settings/protokoll":
+                entity_type = query.get("type", [""])[0]
+                show_all = query.get("all", ["0"])[0] == "1"
+                body, title, active = (
+                    audit_page(connection, entity_type, show_all), "Protokoll", "settings",
                 )
             elif method == "GET" and path == "/settings/microsoft":
                 body, title, active = (

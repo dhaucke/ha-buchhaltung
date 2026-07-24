@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.7.2
+
+- Rechnungs-/Angebots-/Auftrags-/Gutschriftlisten und die
+  Eingangsrechnungen-Übersicht zeigen jetzt ebenfalls nur die letzten 20
+  Einträge mit „Alle anzeigen“-Link statt unbegrenzt alles aufzulisten
+- Kundenliste hat jetzt ein Suchfeld (Name, Kundennummer, Ansprechpartner,
+  E-Mail)
+- neue Seite „Protokoll“ unter den Einstellungen zeigt das bereits
+  bestehende, bisher unsichtbare Änderungsprotokoll (wer/was/wann),
+  filterbar nach Bereich
+- Dauerrechnungen können jetzt gelöscht werden, nicht mehr nur pausiert
+  werden – bereits erzeugte Rechnungen bleiben davon unberührt
+- Rechnungs-/Gutschriftversand zeigt jetzt eine Vorschau mit editierbarem
+  Betreff und Text vor dem Senden, analog zu den Zahlungserinnerungen,
+  statt sofort ohne Vorschau zu versenden
+
 ## 0.7.1
 
 - Dokumentenliste in der Kundenansicht zeigt standardmäßig nur die
