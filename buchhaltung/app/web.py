@@ -8,6 +8,7 @@ import os
 import re
 import sqlite3
 import urllib.parse
+import zipfile
 import base64
 import calendar
 import unicodedata
@@ -616,6 +617,34 @@ def dashboard(connection) -> str:
         <td><span class="status {h(d['status'])}">{h(DOCUMENT_STATUS.get(d['status'], d['status']))}</span></td></tr>"""
         for d in recent
     ) or '<tr><td colspan="6" class="empty">Noch keine Dokumente vorhanden.</td></tr>'
+    draft_threshold_days = 14
+    stale_since = (date.today() - timedelta(days=draft_threshold_days)).isoformat()
+    stale_drafts = rows(
+        connection,
+        """
+        SELECT d.*, c.company FROM documents d JOIN customers c ON c.id=d.customer_id
+        WHERE d.status='draft' AND substr(d.created_at,1,10) < ?
+        ORDER BY d.created_at ASC LIMIT 20
+        """,
+        (stale_since,),
+    )
+    stale_drafts_card = ""
+    if stale_drafts:
+        stale_rows = "".join(
+            f"""<tr><td><a href="/document/{d['id']}">{h(TYPE_LABELS[d['document_type']])}</a></td>
+            <td>{h(d['company'])}</td><td>{h(d['title']) or '–'}</td>
+            <td>{german_date(d['created_at'][:10])}</td>
+            <td><div class="row-actions"><a class="button compact" href="/document/{d['id']}">Öffnen</a>
+            <form method="post" action="/document/{d['id']}/delete"
+            onsubmit="return confirm('Diesen Entwurf endgültig löschen?')">
+            <button class="button compact danger">Löschen</button></form></div></td></tr>"""
+            for d in stale_drafts
+        )
+        stale_drafts_card = f"""
+        <div class="card"><div class="card-head"><h2>Alte Entwürfe</h2>
+        <p class="muted">Seit mehr als {draft_threshold_days} Tagen unverändert im Entwurfsstatus.</p></div>
+        <div class="table-wrap"><table><thead><tr><th>Art</th><th>Kunde</th><th>Betreff</th>
+        <th>Angelegt am</th><th></th></tr></thead><tbody>{stale_rows}</tbody></table></div></div>"""
     return f"""
     <div class="actions"><a class="button primary" href="/document/new?type=invoice">Neue Rechnung</a>
     <a class="button" href="/document/new?type=offer">Neues Angebot</a></div>
@@ -625,6 +654,7 @@ def dashboard(connection) -> str:
       <article><span>Offener Betrag</span><strong>{money(stats['outstanding'])}</strong></article>
       <article><span>Bezahlt {date.today().year}</span><strong>{money(stats['paid'])}</strong></article>
     </div>
+    {stale_drafts_card}
     <div class="card"><div class="card-head"><h2>Letzte Dokumente</h2></div>
     <div class="table-wrap"><table><thead><tr><th>Nummer</th><th>Art</th><th>Kunde</th>
     <th>Datum</th><th>Betrag</th><th>Status</th></tr></thead><tbody>{recent_rows}</tbody></table></div></div>
@@ -681,11 +711,18 @@ def customers_page(connection, search: str = "") -> str:
     <tbody>{customer_rows}</tbody></table></div></div>"""
 
 
-def customer_form(customer=None) -> str:
+def customer_form(customer=None, warning: str = "") -> str:
     customer = dict(customer or {})
-    editing = bool(customer)
+    editing = bool(customer.get("id"))
     action = f"/customer/{customer['id']}/edit" if editing else "/customer/new"
+    warning_html = f'<div class="alert error">{h(warning)}</div>' if warning else ""
+    confirm_field = '<input type="hidden" name="confirm_duplicate" value="1">' if warning else ""
+    submit_label = (
+        "Änderungen speichern" if editing else
+        ("Trotzdem anlegen" if warning else "Kunde speichern")
+    )
     return f"""
+    {warning_html}
     <form class="card form" method="post" action="{action}">
       <div class="form-grid">
         <label><span>Unternehmen *</span><input required name="company" value="{h(customer.get('company'))}"></label>
@@ -698,8 +735,9 @@ def customer_form(customer=None) -> str:
         <label><span>Buyer Reference</span><input name="buyer_reference" value="{h(customer.get('buyer_reference'))}"></label>
         <label class="wide"><span>Notizen</span><textarea name="notes">{h(customer.get('notes'))}</textarea></label>
       </div>
+      {confirm_field}
       <div class="form-actions"><a class="button" href="/customers">Abbrechen</a>
-      <button class="button primary">{'Änderungen speichern' if editing else 'Kunde speichern'}</button></div>
+      <button class="button primary">{submit_label}</button></div>
     </form>"""
 
 
@@ -887,6 +925,37 @@ def reminders_page(connection) -> str:
     </tr></thead><tbody>{invoice_rows}</tbody></table></div></div>"""
 
 
+def reminder_gate(connection, document: dict) -> tuple[int, int]:
+    """Check due date, grace period and reminder interval; return (next_level, overdue_days)."""
+    if not document.get("due_date") or date.fromisoformat(document["due_date"]) >= date.today():
+        raise ValueError("Die Rechnung ist noch nicht überfällig.")
+    settings = DB.settings()
+    grace_days = int(settings.get("reminder_grace_days", "3"))
+    interval_days = int(settings.get("reminder_interval_days", "7"))
+    overdue_days = (date.today() - date.fromisoformat(document["due_date"])).days
+    if overdue_days < grace_days:
+        raise ValueError(
+            f"Die Karenzzeit von {grace_days} Tag(en) nach Fälligkeit ist noch nicht "
+            f"abgelaufen (seit {overdue_days} Tag(en) überfällig)."
+        )
+    previous_row = connection.execute(
+        "SELECT max(reminder_level) level, max(reminder_date) last_date "
+        "FROM payment_reminders WHERE document_id=? AND status='sent'",
+        (document["id"],),
+    ).fetchone()
+    previous = previous_row["level"] or 0
+    if previous >= 3:
+        raise ValueError("Für diese Rechnung wurden bereits drei Zahlungserinnerungen versendet.")
+    if previous_row["last_date"]:
+        days_since_last = (date.today() - date.fromisoformat(previous_row["last_date"])).days
+        if days_since_last < interval_days:
+            raise ValueError(
+                f"Seit der letzten Erinnerung sind erst {days_since_last} von "
+                f"mindestens {interval_days} Tag(en) vergangen."
+            )
+    return previous + 1, overdue_days
+
+
 def reminder_form(connection, document_id: int) -> str:
     document = fetch_document(connection, document_id)
     if (
@@ -894,18 +963,9 @@ def reminder_form(connection, document_id: int) -> str:
         or document["status"] not in ("final", "sent")
     ):
         raise ValueError("Für diese Rechnung kann keine Zahlungserinnerung erstellt werden.")
-    if not document.get("due_date") or date.fromisoformat(document["due_date"]) >= date.today():
-        raise ValueError("Die Rechnung ist noch nicht überfällig.")
     if not document["customer_email"]:
         raise ValueError("Beim Kunden ist keine Rechnungs-E-Mail hinterlegt.")
-    previous = connection.execute(
-        "SELECT max(reminder_level) FROM payment_reminders WHERE document_id=? AND status='sent'",
-        (document_id,),
-    ).fetchone()[0] or 0
-    if previous >= 3:
-        raise ValueError("Für diese Rechnung wurden bereits drei Zahlungserinnerungen versendet.")
-    level = previous + 1
-    overdue_days = (date.today() - date.fromisoformat(document["due_date"])).days
+    level, overdue_days = reminder_gate(connection, document)
     open_amount = outstanding_cents(connection, document_id)
     if open_amount <= 0:
         raise ValueError("Für diese Rechnung besteht kein offener Betrag mehr.")
@@ -949,12 +1009,7 @@ def send_payment_reminder(connection, document_id: int, form: dict) -> None:
     if not document["customer_email"]:
         raise ValueError("Beim Kunden ist keine Rechnungs-E-Mail hinterlegt.")
     level = int(form.get("reminder_level", "0"))
-    expected = (connection.execute(
-        "SELECT max(reminder_level) FROM payment_reminders WHERE document_id=? AND status='sent'",
-        (document_id,),
-    ).fetchone()[0] or 0) + 1
-    if expected > 3:
-        raise ValueError("Für diese Rechnung wurden bereits drei Zahlungserinnerungen versendet.")
+    expected, _ = reminder_gate(connection, document)
     if level != expected:
         raise ValueError("Die Erinnerungsstufe ist nicht mehr aktuell. Bitte Vorschau neu öffnen.")
     subject = str(form.get("subject", "")).strip()
@@ -2303,7 +2358,16 @@ def settings_page(settings: dict[str, str]) -> str:
       {inputs}
       </div>
       <div class="form-actions"><button class="button primary">Einstellungen speichern</button></div>
-    </form>"""
+    </form>
+    <div class="card">
+      <h3>Datensicherung</h3>
+      <p class="muted">Enthält die Datenbank (Kunden, Dokumente, Eingangsrechnungen,
+      Einstellungen), das Logo sowie alle erzeugten und importierten PDF-Belege.
+      Enthält nicht den privaten Microsoft-Graph-Schlüssel – der verlässt dieses
+      Gerät bewusst nie; nach einer Wiederherstellung ggf. ein neues Zertifikat erstellen.
+      Sicher aufbewahren, die Sicherung enthält vollständige Geschäftsdaten.</p>
+      <div class="form-actions"><a class="button" href="/settings/backup.zip">Datensicherung herunterladen</a></div>
+    </div>"""
 
 
 def settings_billing_page(settings: dict[str, str]) -> str:
@@ -2315,6 +2379,12 @@ def settings_billing_page(settings: dict[str, str]) -> str:
       <div class="form-grid">
       <label><span>Zahlungsziel in Tagen</span>
       <input name="payment_terms_days" value="{h(settings.get('payment_terms_days', ''))}"></label>
+      <label><span>Karenztage bis zur ersten Zahlungserinnerung</span>
+      <input type="number" min="0" name="reminder_grace_days"
+      value="{h(settings.get('reminder_grace_days', '3'))}"></label>
+      <label><span>Mindestabstand zwischen Zahlungserinnerungen in Tagen</span>
+      <input type="number" min="0" name="reminder_interval_days"
+      value="{h(settings.get('reminder_interval_days', '7'))}"></label>
       <label class="check wide"><input type="checkbox" name="small_business_enabled" {checked}>
       <span>Kleinunternehmerregelung nach § 19 UStG verwenden</span></label>
       <label class="wide"><span>Kleinunternehmer-Hinweis</span>
@@ -2421,6 +2491,18 @@ def audit_page(connection, entity_type: str = "", show_all: bool = False) -> str
     <th>Aktion</th><th>Details</th></tr></thead><tbody>{entry_rows}</tbody></table></div></div>"""
 
 
+def certificate_expiry(cert_path: str) -> date | None:
+    path = Path(cert_path)
+    if not path.is_file():
+        return None
+    try:
+        from cryptography import x509
+        certificate = x509.load_pem_x509_certificate(path.read_bytes())
+        return certificate.not_valid_after_utc.date()
+    except Exception:
+        return None
+
+
 def microsoft_setup_page(settings: dict[str, str]) -> str:
     client_id = settings.get("graph_client_id", "")
     object_id = settings.get("graph_service_principal_object_id", "")
@@ -2443,6 +2525,22 @@ def microsoft_setup_page(settings: dict[str, str]) -> str:
     if not Path(settings.get("graph_private_key_path", "")).is_file():
         missing.append("privater Schlüssel")
     status_text = "vollständig eingerichtet" if not missing else "fehlt noch: " + ", ".join(missing)
+    expiry = certificate_expiry(settings.get("graph_certificate_path", ""))
+    expiry_warning = ""
+    if expiry:
+        days_left = (expiry - date.today()).days
+        if days_left < 0:
+            expiry_warning = (
+                f'<div class="alert error">Das Zertifikat ist seit dem {german_date(expiry.isoformat())} '
+                "abgelaufen. Mailversand über Microsoft Graph funktioniert nicht mehr, bis ein "
+                "neues Zertifikat erstellt und bei Microsoft hochgeladen wurde.</div>"
+            )
+        elif days_left <= 60:
+            expiry_warning = (
+                f'<div class="alert error">Das Zertifikat läuft in {days_left} Tagen '
+                f"(am {german_date(expiry.isoformat())}) ab. Rechtzeitig ein neues Zertifikat "
+                "erstellen und bei Microsoft hochladen.</div>"
+            )
     commands = f"""Connect-ExchangeOnline
 New-ServicePrincipal -AppId "{client_id or '<CLIENT-ID>'}" -ObjectId "{object_id or '<DIENSTPRINZIPAL-OBJEKT-ID>'}" -DisplayName "Buchhaltung"
 New-ManagementScope -Name "{scope_name}" -RecipientRestrictionFilter "PrimarySmtpAddress -eq '{sender or '<ABSENDER-POSTFACH>'}'"
@@ -2507,6 +2605,8 @@ Test-ServicePrincipalAuthorization -Identity "{object_id or '<DIENSTPRINZIPAL-OB
       <p class="muted">Empfohlen: Zertifikat und privaten Schlüssel hier erstellen lassen.
       Der private Schlüssel bleibt dabei auf diesem Gerät; nur die heruntergeladene
       Zertifikatsdatei wird bei Microsoft hochgeladen.</p>
+      {f'<p class="muted">Gültig bis {german_date(expiry.isoformat())}.</p>' if expiry else ''}
+      {expiry_warning}
       <div class="form-actions">
       <form method="post" action="/settings/microsoft/generate-certificate"
             onsubmit="return confirm('{h(generate_confirm)}')">
@@ -2650,6 +2750,30 @@ def application(environ, start_response):
                 body, title, active = customer_form(), "Neuer Kunde", "customers"
             elif method == "POST" and path == "/customer/new":
                 form = parse_form(environ)
+                if form.get("confirm_duplicate") != "1":
+                    company_needle = form["company"].strip().lower()
+                    email_needle = form.get("email", "").strip().lower()
+                    duplicate = connection.execute(
+                        """
+                        SELECT company FROM customers
+                        WHERE lower(trim(company))=?
+                           OR (? != '' AND lower(email)=?)
+                        LIMIT 1
+                        """,
+                        (company_needle, email_needle, email_needle),
+                    ).fetchone()
+                    if duplicate:
+                        body, title, active = (
+                            customer_form(
+                                form,
+                                f"Es existiert bereits ein Kunde „{duplicate['company']}“ mit "
+                                "gleichem Namen oder gleicher E-Mail-Adresse.",
+                            ),
+                            "Neuer Kunde", "customers",
+                        )
+                        return response(
+                            start_response, layout(title, flash + body, active), headers=flash_headers,
+                        )
                 settings = DB.settings()
                 number = int(settings["customer_counter"]) + 1
                 now = Database.now()
@@ -3606,6 +3730,26 @@ def application(environ, start_response):
                 )
             elif method == "GET" and path == "/settings":
                 body, title, active = settings_page(DB.settings()), "Einstellungen", "settings"
+            elif method == "GET" and path == "/settings/backup.zip":
+                buffer = BytesIO()
+                with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as backup_zip:
+                    db_path = DATA_DIR / "buchhaltung.sqlite3"
+                    if db_path.is_file():
+                        backup_zip.write(db_path, "buchhaltung.sqlite3")
+                    if COMPANY_LOGO.is_file():
+                        backup_zip.write(COMPANY_LOGO, COMPANY_LOGO.name)
+                    for subdir in ("documents", "archive", "reports"):
+                        folder = DATA_DIR / subdir
+                        if not folder.is_dir():
+                            continue
+                        for file in folder.rglob("*"):
+                            if file.is_file():
+                                backup_zip.write(file, f"{subdir}/{file.relative_to(folder)}")
+                filename = f"buchhaltung-backup-{date.today().isoformat()}.zip"
+                return response(
+                    start_response, buffer.getvalue(), content_type="application/zip",
+                    headers=[("Content-Disposition", f'attachment; filename="{filename}"')],
+                )
             elif method == "GET" and path == "/settings/rechnungswesen":
                 body, title, active = (
                     settings_billing_page(DB.settings()), "Rechnungswesen", "settings",
@@ -3688,6 +3832,17 @@ def application(environ, start_response):
                         raise ValueError("Das Zahlungsziel muss eine ganze Zahl sein.") from exc
                     if not 0 <= terms <= 365:
                         raise ValueError("Das Zahlungsziel muss zwischen 0 und 365 Tagen liegen.")
+                for key, label in (
+                    ("reminder_grace_days", "Die Karenztage"),
+                    ("reminder_interval_days", "Der Mindestabstand"),
+                ):
+                    if key in values:
+                        try:
+                            days = int(values[key])
+                        except ValueError as exc:
+                            raise ValueError(f"{label} müssen eine ganze Zahl sein.") from exc
+                        if not 0 <= days <= 90:
+                            raise ValueError(f"{label} müssen zwischen 0 und 90 Tagen liegen.")
                 DB.update_settings(values)
                 return_to = form.get("return_to")
                 if return_to not in (

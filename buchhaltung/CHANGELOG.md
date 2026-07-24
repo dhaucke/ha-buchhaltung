@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.7.3
+
+- Karenzzeit vor der ersten und Mindestabstand zwischen
+  Zahlungserinnerungen werden jetzt tatsächlich geprüft (die
+  entsprechenden Einstellungen existierten bisher, wurden aber nirgends
+  ausgewertet) und sind in den Rechnungswesen-Einstellungen sichtbar
+- Kundenanlage warnt jetzt vor Duplikaten (gleicher Name oder gleiche
+  E-Mail-Adresse) statt sie stillschweigend anzulegen
+- Dashboard zeigt eine Karte „Alte Entwürfe“ für Angebote/Aufträge/
+  Rechnungen, die seit über 14 Tagen unverändert im Entwurfsstatus
+  hängen, mit direktem Lösch-/Öffnen-Link
+- Microsoft-Einrichtungsseite zeigt jetzt das Ablaufdatum des
+  Graph-Zertifikats an und warnt, wenn es abgelaufen ist oder in
+  weniger als 60 Tagen abläuft
+- neuer Button „Datensicherung herunterladen“ in den Einstellungen
+  (Datenbank, Logo, erzeugte und importierte PDFs als ZIP) – bewusst
+  ohne den privaten Microsoft-Graph-Schlüssel, der dieses Gerät nie
+  verlässt
+
 ## 0.7.2
 
 - Rechnungs-/Angebots-/Auftrags-/Gutschriftlisten und die
