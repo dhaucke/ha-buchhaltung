@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.5.3
+
+- fortlaufende Prüfliste für importierte PDF-Belege
+- Archiv kennzeichnet Belege als offen oder geprüft
+- „Prüfung fortsetzen“ öffnet direkt den nächsten offenen Beleg
+- „Geprüft & nächster Beleg“ speichert die erkannten Daten und wechselt weiter
+- „Speichern & nächster Beleg“ verbucht den Zahlungsstatus und lädt unmittelbar
+  den nächsten offenen Beleg
+- nach dem letzten Beleg führt der Arbeitsablauf automatisch zurück ins Archiv
+
 ## 0.5.2
 
 - PDF-Import erkennt weiterhin identische Dateien über ihre SHA-256-Prüfsumme

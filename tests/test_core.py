@@ -314,6 +314,50 @@ class CoreTests(unittest.TestCase):
         self.assertIsNotNone(same_supplier)
         self.assertIsNone(other_supplier)
 
+    def test_review_queue_returns_only_open_archives(self):
+        now = Database.now()
+        with self.db.connect() as connection:
+            first_id = connection.execute(
+                """
+                INSERT INTO archive_files(
+                    original_filename, stored_filename, sha256, mime_type,
+                    file_size, uploaded_at, document_direction
+                ) VALUES ('eins.pdf','eins.pdf','queue-one','application/pdf',
+                          123,?,'outgoing')
+                """,
+                (now,),
+            ).lastrowid
+            reviewed_id = connection.execute(
+                """
+                INSERT INTO archive_files(
+                    original_filename, stored_filename, sha256, mime_type,
+                    file_size, uploaded_at, document_direction, reviewed_at
+                ) VALUES ('zwei.pdf','zwei.pdf','queue-two','application/pdf',
+                          123,?,'outgoing',?)
+                """,
+                (now, now),
+            ).lastrowid
+            incoming_id = connection.execute(
+                """
+                INSERT INTO archive_files(
+                    original_filename, stored_filename, sha256, mime_type,
+                    file_size, uploaded_at, document_direction
+                ) VALUES ('drei.pdf','drei.pdf','queue-three','application/pdf',
+                          123,?,'incoming')
+                """,
+                (now,),
+            ).lastrowid
+
+            outgoing_next = Database.next_unreviewed_archive_id(
+                connection, reviewed_id, "outgoing"
+            )
+            incoming_next = Database.next_unreviewed_archive_id(
+                connection, None, "incoming"
+            )
+
+        self.assertEqual(outgoing_next, first_id)
+        self.assertEqual(incoming_next, incoming_id)
+
     def test_recurring_invoice_schema_exists(self):
         with self.db.connect() as connection:
             tables = {

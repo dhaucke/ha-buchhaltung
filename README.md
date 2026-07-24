@@ -6,7 +6,7 @@ EÜR-Arbeitsunterlage. Sämtliche Firmendaten und das
 Unternehmenslogo werden erst bei der Ersteinrichtung eingegeben und
 ausschließlich im persistenten Datenverzeichnis gespeichert.
 
-## Stand 0.5.2
+## Stand 0.5.3
 
 - neutraler Ersteinrichtungs-Assistent ohne fest eingebaute Firmendaten
 - eigenes Logo als PNG, JPG oder WebP
@@ -27,6 +27,8 @@ ausschließlich im persistenten Datenverzeichnis gespeichert.
 - unveränderter Import alter PDF-Rechnungen mit SHA-256-Prüfsumme
 - Massenimport für bis zu 50 PDF-Belege (maximal 20 MB je Datei)
 - Dublettenprüfung anhand der Datei-Prüfsumme und der erkannten Belegdaten
+- fortlaufende Prüfliste mit offen/geprüft-Status und direktem Wechsel zum
+  nächsten importierten Beleg
 - getrennte Verarbeitung von Ausgangs- und Eingangsrechnungen
 - Original-PDFs direkt im Archiv öffnen
 - Rechnungsnummer, Datum, Betrag, Kundennummer und Kundenanschrift auslesen

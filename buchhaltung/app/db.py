@@ -91,6 +91,7 @@ CREATE TABLE IF NOT EXISTS archive_files (
     detected_postal_code TEXT NOT NULL DEFAULT '',
     detected_city TEXT NOT NULL DEFAULT '',
     analyzed_at TEXT,
+    reviewed_at TEXT,
     analysis_error TEXT NOT NULL DEFAULT ''
 );
 
@@ -293,6 +294,7 @@ class Database:
                 "detected_postal_code": "TEXT NOT NULL DEFAULT ''",
                 "detected_city": "TEXT NOT NULL DEFAULT ''",
                 "analyzed_at": "TEXT",
+                "reviewed_at": "TEXT",
                 "analysis_error": "TEXT NOT NULL DEFAULT ''",
                 "document_direction": "TEXT NOT NULL DEFAULT 'outgoing'",
                 "payment_date": "TEXT",
@@ -308,6 +310,10 @@ class Database:
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS idx_archive_direction "
                 "ON archive_files(document_direction)"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_archive_review_queue "
+                "ON archive_files(document_direction, reviewed_at, uploaded_at)"
             )
             connection.executemany(
                 "INSERT OR IGNORE INTO settings(key, value) VALUES (?, ?)",
@@ -483,3 +489,34 @@ class Database:
                 (invoice_number, issue_date, amount_cents),
             ).fetchone()
         return None
+
+    @staticmethod
+    def next_unreviewed_archive_id(
+        connection: sqlite3.Connection,
+        current_id: int | None = None,
+        direction: str | None = None,
+    ) -> int | None:
+        if current_id is not None and direction is None:
+            current = connection.execute(
+                "SELECT document_direction FROM archive_files WHERE id=?",
+                (current_id,),
+            ).fetchone()
+            direction = current["document_direction"] if current else None
+        conditions = ["reviewed_at IS NULL"]
+        parameters: list[object] = []
+        if current_id is not None:
+            conditions.append("id!=?")
+            parameters.append(current_id)
+        if direction in ("outgoing", "incoming"):
+            conditions.append("document_direction=?")
+            parameters.append(direction)
+        row = connection.execute(
+            f"""
+            SELECT id FROM archive_files
+            WHERE {' AND '.join(conditions)}
+            ORDER BY uploaded_at DESC, id DESC
+            LIMIT 1
+            """,
+            tuple(parameters),
+        ).fetchone()
+        return int(row["id"]) if row else None

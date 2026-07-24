@@ -1474,6 +1474,13 @@ def archive_page(connection) -> str:
         ORDER BY a.uploaded_at DESC
         """,
     )
+    open_files = [file for file in files if not file["reviewed_at"]]
+    continue_button = (
+        f'<a class="button primary" href="/archive/{open_files[0]["id"]}">'
+        f'Prüfung fortsetzen · {len(open_files)} offen</a>'
+        if open_files else
+        '<span class="status paid">Alle importierten Belege geprüft</span>'
+    )
     file_rows = "".join(
         f"<tr><td><strong>{h(f['original_filename'])}</strong></td>"
         f"<td><span class='status'>{'Eingang' if f['document_direction'] == 'incoming' else 'Ausgang'}</span><br>"
@@ -1482,6 +1489,8 @@ def archive_page(connection) -> str:
         f"{f'<br><small>Kd.-Nr. {h(f['detected_customer_number'])}</small>' if f['detected_customer_number'] else ''}</td>"
         f"<td>{german_date(f['detected_issue_date']) if f['detected_issue_date'] else '–'}</td>"
         f"<td class='money'>{money(f['detected_amount_cents']) if f['detected_amount_cents'] is not None else '–'}</td>"
+        f"<td><span class='status {'paid' if f['reviewed_at'] else ''}'>"
+        f"{'Geprüft' if f['reviewed_at'] else 'Offen'}</span></td>"
         f"<td><div class='row-actions'><a class='button compact' href='/archive/{f['id']}'>Prüfen</a>"
         f"<a class='button compact' target='_blank' href='/archive/{f['id']}/pdf'>Öffnen</a>"
         f"<form method='post' action='/archive/{f['id']}/analyze'><button class='button compact'>Neu analysieren</button></form>"
@@ -1494,8 +1503,9 @@ def archive_page(connection) -> str:
         )
         + f"</div></td></tr>"
         for f in files
-    ) or '<tr><td colspan="6" class="empty">Noch keine alten Rechnungen importiert.</td></tr>'
+    ) or '<tr><td colspan="7" class="empty">Noch keine alten Rechnungen importiert.</td></tr>'
     return f"""
+    <div class="actions">{continue_button}</div>
     <div class="card form">
       <h2>PDF-Belege importieren</h2>
       <p class="muted">Bis zu 50 PDFs gemeinsam auswählen. Die Originaldateien bleiben
@@ -1513,7 +1523,7 @@ def archive_page(connection) -> str:
       <label><span>Betrag in EUR</span><input name="amount" inputmode="decimal"></label></div>
       <div class="form-actions"><button class="button primary">Belege hochladen und analysieren</button></div></form>
     </div>
-    <div class="card"><div class="table-wrap"><table><thead><tr><th>Datei</th><th>Nummer</th><th>Kunde</th><th>Datum</th><th>Betrag</th><th>Aktionen</th></tr></thead>
+    <div class="card"><div class="table-wrap"><table><thead><tr><th>Datei</th><th>Nummer</th><th>Kunde</th><th>Datum</th><th>Betrag</th><th>Prüfung</th><th>Aktionen</th></tr></thead>
     <tbody>{file_rows}</tbody></table></div></div>"""
 
 
@@ -1530,6 +1540,25 @@ def archive_detail(connection, archive_id: int) -> str:
     ).fetchone()
     if not item:
         raise ValueError("Archivdatei wurde nicht gefunden.")
+    next_id = Database.next_unreviewed_archive_id(
+        connection, archive_id, item["document_direction"]
+    )
+    open_count = connection.execute(
+        """
+        SELECT count(*) FROM archive_files
+        WHERE document_direction=? AND reviewed_at IS NULL
+        """,
+        (item["document_direction"],),
+    ).fetchone()[0]
+    queue_state = (
+        f'<span class="status paid">Geprüft</span>'
+        if item["reviewed_at"] else
+        f'<span class="status">{open_count} Belege offen</span>'
+    )
+    next_button = (
+        f'<a class="button" href="/archive/{next_id}">Nächster offener Beleg</a>'
+        if next_id else ""
+    )
     amount_value = (
         f"{item['detected_amount_cents'] / 100:.2f}".replace(".", ",")
         if item["detected_amount_cents"] is not None else ""
@@ -1582,12 +1611,18 @@ def archive_detail(connection, archive_id: int) -> str:
             </select></label>
             <label><span>Zahlungsdatum</span><input type="date" name="payment_date" value="{h(item['payment_date'])}"></label>
           </div>
-          <div class="form-actions"><button class="button">Zahlungsstatus speichern</button></div>
+          <div class="form-actions">
+            <button class="button">Zahlungsstatus speichern</button>
+            <button class="button primary" name="continue" value="1">
+              Speichern &amp; nächster Beleg
+            </button>
+          </div>
         </form>"""
     return f"""
     {state}{warning}
     <form id="archive-customer-import" method="post" action="/archive/{archive_id}/customer"></form>
     <div class="actions">
+      {queue_state}{next_button}
       <a class="button" target="_blank" href="/archive/{archive_id}/pdf">Original-PDF öffnen</a>
       <form method="post" action="/archive/{archive_id}/analyze"><button class="button">Neu analysieren</button></form>
       {incoming_button}{delete_button}
@@ -1605,7 +1640,13 @@ def archive_detail(connection, archive_id: int) -> str:
         <label><span>PLZ</span><input name="postal_code" value="{h(item['detected_postal_code'])}"></label>
         <label><span>Ort</span><input name="city" value="{h(item['detected_city'])}"></label>
       </div>
-      <div class="form-actions"><button class="button">Korrekturen speichern</button>{customer_button}</div>
+      <div class="form-actions">
+        <button class="button">Korrekturen speichern</button>
+        <button class="button primary" name="continue" value="1">
+          Geprüft &amp; nächster Beleg
+        </button>
+        {customer_button}
+      </div>
     </form>
     {payment_form}
     <details class="card extracted"><summary>Erkannten PDF-Text anzeigen</summary>
@@ -2506,6 +2547,26 @@ def application(environ, start_response):
                     "Kundennummer mit dem bestehenden Kunden verknüpft."
                     if linked else "Korrekturen wurden gespeichert."
                 )
+                if form.get("continue") == "1":
+                    connection.execute(
+                        "UPDATE archive_files SET reviewed_at=? WHERE id=?",
+                        (Database.now(), archive_id),
+                    )
+                    Database.audit(connection, "archive", archive_id, "reviewed")
+                    next_id = Database.next_unreviewed_archive_id(
+                        connection, archive_id
+                    )
+                    if next_id:
+                        return redirect(
+                            start_response,
+                            f"/archive/{next_id}",
+                            f"{message} Nächster offener Beleg wurde geladen.",
+                        )
+                    return redirect(
+                        start_response,
+                        "/archive",
+                        f"{message} Die Prüfliste ist vollständig abgearbeitet.",
+                    )
                 return redirect(start_response, f"/archive/{archive_id}", message)
             elif method == "POST" and re.fullmatch(r"/archive/\d+/payment", path):
                 archive_id = int(path.split("/")[2])
@@ -2536,6 +2597,30 @@ def application(environ, start_response):
                     ),
                 )
                 Database.audit(connection, "archive", archive_id, f"accounting_{status}")
+                if form.get("continue") == "1":
+                    connection.execute(
+                        "UPDATE archive_files SET reviewed_at=? WHERE id=?",
+                        (now, archive_id),
+                    )
+                    Database.audit(
+                        connection, "archive", archive_id, "reviewed_after_accounting"
+                    )
+                    next_id = Database.next_unreviewed_archive_id(
+                        connection, archive_id
+                    )
+                    if next_id:
+                        return redirect(
+                            start_response,
+                            f"/archive/{next_id}",
+                            "Zahlungsstatus wurde gespeichert. "
+                            "Nächster offener Beleg wurde geladen.",
+                        )
+                    return redirect(
+                        start_response,
+                        "/archive",
+                        "Zahlungsstatus wurde gespeichert. "
+                        "Die Prüfliste ist vollständig abgearbeitet.",
+                    )
                 return redirect(start_response, f"/archive/{archive_id}", "Zahlungsstatus wurde gespeichert.")
             elif method == "POST" and re.fullmatch(r"/archive/\d+/customer", path):
                 archive_id = int(path.split("/")[2])
