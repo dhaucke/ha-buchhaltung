@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.5
+
+- Nummernkreis-Zähler (Rechnungen, Kunden, Angebote, Aufträge) lassen sich
+  jetzt auch nach der Ersteinrichtung in den Einstellungen einsehen und
+  korrigieren – vorher gab es dafür keine Möglichkeit mehr
+
 ## 0.6.4
 
 - neuer Button „Testmail senden“ auf der Microsoft-Einrichtungsseite prüft

@@ -2120,6 +2120,28 @@ def settings_page(settings: dict[str, str]) -> str:
       <input name="small_business_notice" value="{h(settings.get('small_business_notice'))}"></label>
       </div>
       <div class="form-actions"><button class="button primary">Einstellungen speichern</button></div>
+    </form>
+    <form class="card form" method="post" action="/settings/counters">
+      <h3>Nummernkreise korrigieren</h3>
+      <p class="muted">Zählerstand vor dem nächsten neu erzeugten Dokument dieser Art.
+      Beispiel: Wird bei Rechnungen 132 eingetragen, erhält die nächste Rechnung die
+      laufende Nummer 0133. Nur ändern, wenn ein Zähler durch einen Fehler
+      falsch gesetzt wurde – ansonsten drohen doppelte oder übersprungene Nummern.</p>
+      <div class="form-grid">
+      <label><span>Letzte Rechnungs-/Gutschriftnummer</span>
+      <input required type="number" min="0" name="invoice_counter"
+      value="{h(settings.get('invoice_counter', '0'))}"></label>
+      <label><span>Letzte Kundennummer</span>
+      <input required type="number" min="0" name="customer_counter"
+      value="{h(settings.get('customer_counter', '0'))}"></label>
+      <label><span>Letzte Angebotsnummer</span>
+      <input required type="number" min="0" name="offer_counter"
+      value="{h(settings.get('offer_counter', '0'))}"></label>
+      <label><span>Letzte Auftragsnummer</span>
+      <input required type="number" min="0" name="order_counter"
+      value="{h(settings.get('order_counter', '0'))}"></label>
+      </div>
+      <div class="form-actions"><button class="button primary">Zähler speichern</button></div>
     </form>"""
 
 
@@ -3295,6 +3317,21 @@ def application(environ, start_response):
                     else "/settings"
                 )
                 return redirect(start_response, return_to, "Einstellungen wurden gespeichert.")
+            elif method == "POST" and path == "/settings/counters":
+                form = parse_form(environ)
+                counters = {
+                    key: normalized_counter(form.get(key, "0"))
+                    for key in (
+                        "invoice_counter", "customer_counter",
+                        "offer_counter", "order_counter",
+                    )
+                }
+                DB.update_settings(counters)
+                Database.audit(
+                    connection, "settings", None, "counters_corrected",
+                    ", ".join(f"{key}={value}" for key, value in counters.items()),
+                )
+                return redirect(start_response, "/settings", "Zähler wurden gespeichert.")
             else:
                 return response(start_response, layout("Nicht gefunden", "<div class='alert error'>Seite nicht gefunden.</div>"), 404)
     except (ValueError, sqlite3.Error, RuntimeError) as exc:
