@@ -1426,16 +1426,34 @@ def run_recurring_invoice(connection, recurring_id: int, run_date: date, manual:
         return None
     period = run_date.strftime("%Y-%m")
     now = Database.now()
-    try:
-        run_id = connection.execute(
+
+    def create_run():
+        return connection.execute(
             """
             INSERT INTO recurring_runs(recurring_invoice_id, period, status, created_at, updated_at)
             VALUES (?, ?, 'processing', ?, ?)
             """,
             (recurring_id, period, now, now),
         ).lastrowid
+
+    try:
+        run_id = create_run()
     except sqlite3.IntegrityError:
-        return None
+        # A prior run for this period exists. If its document was cancelled
+        # (e.g. it had a wrong number), free up the period instead of
+        # permanently blocking this recurring invoice from ever running again.
+        existing = connection.execute(
+            """
+            SELECT rr.id, d.status document_status
+            FROM recurring_runs rr LEFT JOIN documents d ON d.id=rr.document_id
+            WHERE rr.recurring_invoice_id=? AND rr.period=?
+            """,
+            (recurring_id, period),
+        ).fetchone()
+        if not existing or existing["document_status"] != "cancelled":
+            return None
+        connection.execute("DELETE FROM recurring_runs WHERE id=?", (existing["id"],))
+        run_id = create_run()
 
     last_day = calendar.monthrange(run_date.year, run_date.month)[1]
     service_start = date(run_date.year, run_date.month, 1)

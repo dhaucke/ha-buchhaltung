@@ -1,6 +1,6 @@
 name: "Buchhaltung"
 description: "Lokale Ausgangs- und Eingangsrechnungen mit EÜR-Auswertung"
-version: "0.6.5"
+version: "0.6.6"
 slug: "buchhaltung"
 url: "https://github.com/dhaucke/ha-buchhaltung"
 init: false

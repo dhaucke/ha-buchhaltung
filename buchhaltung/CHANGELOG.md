@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.6
+
+- eine stornierte Monatsrechnung blockiert eine Dauerrechnung nicht mehr
+  dauerhaft für diesen Monat – ein erneuter Lauf ist jetzt möglich, sobald
+  die fehlerhafte Rechnung storniert wurde
+
 ## 0.6.5
 
 - Nummernkreis-Zähler (Rechnungen, Kunden, Angebote, Aufträge) lassen sich
