@@ -1,0 +1,1517 @@
+from __future__ import annotations
+
+import hashlib
+import html
+import json
+import mimetypes
+import os
+import re
+import sqlite3
+import urllib.parse
+import base64
+import calendar
+import threading
+import time
+from io import BytesIO
+from datetime import date, datetime, timedelta
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from email.parser import BytesParser
+from email.policy import default as email_policy
+from http import HTTPStatus
+from http.cookies import SimpleCookie
+from pathlib import Path
+from wsgiref.simple_server import WSGIServer, WSGIRequestHandler, make_server
+from socketserver import ThreadingMixIn
+from PIL import Image as PillowImage, UnidentifiedImageError
+
+from db import Database
+from graph import GraphClient
+from pdfgen import TYPE_LABELS, create_document_pdf, german_date, money
+from pdfimport import analyze_invoice_pdf
+
+
+APP_ROOT = Path(__file__).resolve().parent
+DATA_DIR = Path(os.environ.get("HD_DATA_DIR", "/data"))
+if not DATA_DIR.parent.exists() or not os.access(DATA_DIR.parent, os.W_OK):
+    DATA_DIR = APP_ROOT.parent / "data"
+DB = Database(DATA_DIR)
+DB.initialize()
+COMPANY_LOGO = DATA_DIR / "company-logo.png"
+APP_CSS = (APP_ROOT / "static" / "app.css").read_text(encoding="utf-8")
+
+
+DOCUMENT_STATUS = {
+    "draft": "Entwurf",
+    "final": "Fertiggestellt",
+    "sent": "Versendet",
+    "accepted": "Bestätigt",
+    "paid": "Bezahlt",
+    "cancelled": "Storniert",
+}
+
+
+def h(value) -> str:
+    return html.escape(str(value or ""), quote=True)
+
+
+def parse_form(environ) -> dict:
+    content_type = environ.get("CONTENT_TYPE", "")
+    size = int(environ.get("CONTENT_LENGTH") or 0)
+    raw_bytes = environ["wsgi.input"].read(size)
+    if content_type.startswith("multipart/form-data"):
+        message = BytesParser(policy=email_policy).parsebytes(
+            b"Content-Type: " + content_type.encode("latin-1") + b"\r\n"
+            b"MIME-Version: 1.0\r\n\r\n" + raw_bytes
+        )
+        result = {}
+        for part in message.iter_parts():
+            name = part.get_param("name", header="content-disposition")
+            filename = part.get_filename()
+            payload = part.get_payload(decode=True) or b""
+            if filename:
+                result[name] = UploadedFile(filename, part.get_content_type(), payload)
+            else:
+                charset = part.get_content_charset() or "utf-8"
+                result[name] = payload.decode(charset, errors="replace")
+        return result
+    raw = raw_bytes.decode("utf-8")
+    return {key: values[-1] for key, values in urllib.parse.parse_qs(raw, keep_blank_values=True).items()}
+
+
+class UploadedFile:
+    def __init__(self, filename: str, content_type: str, data: bytes):
+        self.filename = filename
+        self.type = content_type
+        self.data = data
+
+
+def cents(value: str) -> int:
+    normalized = value.strip().replace(".", "").replace(",", ".")
+    try:
+        return int((Decimal(normalized) * 100).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+    except (InvalidOperation, ValueError):
+        return 0
+
+
+def quantity_milli(value: str) -> int:
+    normalized = value.strip().replace(",", ".")
+    try:
+        return int((Decimal(normalized) * 1000).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+    except (InvalidOperation, ValueError):
+        return 1000
+
+
+def normalized_counter(value: str) -> str:
+    try:
+        return str(max(0, int(value.strip() or "0")))
+    except (AttributeError, ValueError):
+        raise ValueError("Nummernkreis-Zähler müssen ganze Zahlen ab 0 sein.")
+
+
+def save_company_logo(upload) -> None:
+    if not upload:
+        return
+    if not isinstance(upload, UploadedFile):
+        raise ValueError("Das Logo konnte nicht verarbeitet werden.")
+    if len(upload.data) > 5 * 1024 * 1024:
+        raise ValueError("Das Logo darf höchstens 5 MB groß sein.")
+    try:
+        with PillowImage.open(BytesIO(upload.data)) as source:
+            source.load()
+            if source.width < 100 or source.height < 40:
+                raise ValueError("Das Logo muss mindestens 100 × 40 Pixel groß sein.")
+            image = source.convert("RGBA")
+            image.thumbnail((1600, 600))
+            image.save(COMPANY_LOGO, format="PNG", optimize=True)
+    except (UnidentifiedImageError, OSError) as exc:
+        raise ValueError("Bitte ein gültiges PNG-, JPG- oder WebP-Logo hochladen.") from exc
+
+
+def company_logo_data_uri() -> str:
+    if not COMPANY_LOGO.is_file():
+        return ""
+    return "data:image/png;base64," + base64.b64encode(COMPANY_LOGO.read_bytes()).decode()
+
+
+def app_name(settings: dict[str, str]) -> str:
+    company = settings.get("company_name", "").strip()
+    return f"{company} Buchhaltung" if company else "Buchhaltung"
+
+
+def flash_cookie(message: str, level: str = "success") -> str:
+    payload = urllib.parse.quote(json.dumps({"message": message, "level": level}))
+    return f"hd_flash={payload}; Path=/; SameSite=Strict"
+
+
+def get_flash(environ):
+    cookies = SimpleCookie(environ.get("HTTP_COOKIE", ""))
+    if "hd_flash" not in cookies:
+        return "", []
+    try:
+        payload = json.loads(urllib.parse.unquote(cookies["hd_flash"].value))
+        value = f'<div class="alert {h(payload["level"])}">{h(payload["message"])}</div>'
+    except Exception:
+        value = ""
+    return value, [("Set-Cookie", "hd_flash=; Path=/; Max-Age=0; SameSite=Strict")]
+
+
+def layout(title: str, body: str, active: str = "") -> str:
+    settings = DB.settings()
+    application_name = app_name(settings)
+    company_name = settings.get("company_name", "") or "Buchhaltung"
+    logo_data_uri = company_logo_data_uri()
+    brand_visual = (
+        f'<img src="{logo_data_uri}" alt="{h(company_name)}">'
+        if logo_data_uri
+        else '<div class="brand-placeholder">B</div>'
+    )
+    sidebar_note = (
+        "Kleinunternehmer · § 19 UStG"
+        if settings.get("small_business_enabled", "1") == "1"
+        else "Rechnungsverwaltung"
+    )
+    nav = [
+        ("/", "dashboard", "Übersicht"),
+        ("/customers", "customers", "Kunden"),
+        ("/documents?type=offer", "offer", "Angebote"),
+        ("/documents?type=order", "order", "Aufträge"),
+        ("/documents?type=invoice", "invoice", "Rechnungen"),
+        ("/archive", "archive", "Archiv"),
+        ("/settings", "settings", "Einstellungen"),
+    ]
+    links = "".join(
+        f'<a class="{"active" if key == active else ""}" href="{url}">{label}</a>'
+        for url, key, label in nav
+    )
+    return f"""<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>{h(title)} · {h(application_name)}</title>
+  <style>{APP_CSS}</style>
+</head>
+<body>
+  <aside class="sidebar">
+    <div class="brand">{brand_visual}<strong>{h(application_name)}</strong></div>
+    <nav>{links}</nav>
+    <div class="sidebar-foot">{h(sidebar_note)}</div>
+  </aside>
+  <main>
+    <header class="topbar"><div><span>{h(company_name)}</span><h1>{h(title)}</h1></div></header>
+    <section class="content">{body}</section>
+  </main>
+  <script>
+  (() => {{
+    const marker = "/api/hassio_ingress/";
+    const path = window.location.pathname;
+    const markerPos = path.indexOf(marker);
+    let root = "/";
+    if (markerPos >= 0) {{
+      const afterMarker = markerPos + marker.length;
+      const tokenEnd = path.indexOf("/", afterMarker);
+      root = tokenEnd >= 0 ? path.slice(0, tokenEnd + 1) : path + "/";
+    }}
+    const ingressUrl = value => {{
+      if (!value || !value.startsWith("/")) return value;
+      return root + value.slice(1);
+    }};
+    document.querySelectorAll("a[href]").forEach(link => {{
+      link.setAttribute("href", ingressUrl(link.getAttribute("href")));
+    }});
+    document.querySelectorAll("form[action]").forEach(form => {{
+      form.setAttribute("action", ingressUrl(form.getAttribute("action")));
+    }});
+    document.querySelectorAll("[formaction]").forEach(button => {{
+      button.setAttribute("formaction", ingressUrl(button.getAttribute("formaction")));
+    }});
+  }})();
+  </script>
+</body>
+</html>"""
+
+
+def setup_page(settings: dict[str, str]) -> str:
+    logo_data_uri = company_logo_data_uri()
+    logo_preview = (
+        f'<img class="setup-logo-preview" src="{logo_data_uri}" alt="Aktuelles Logo">'
+        if logo_data_uri else
+        '<div class="setup-logo-empty">Noch kein Logo hinterlegt</div>'
+    )
+    checked = "checked" if settings.get("small_business_enabled", "1") == "1" else ""
+    return f"""<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Ersteinrichtung · Buchhaltung</title>
+  <style>{APP_CSS}</style>
+</head>
+<body class="setup-body">
+  <main class="setup-main">
+    <section class="setup-intro">
+      <div class="setup-mark">B</div>
+      <span>Lokale Rechnungsverwaltung</span>
+      <h1>Buchhaltung einrichten</h1>
+      <p>Die Angaben werden ausschließlich im persistenten Datenverzeichnis dieser
+      Installation gespeichert und für Oberfläche, PDFs und E-Mails verwendet.</p>
+    </section>
+    <form class="setup-card" method="post" enctype="multipart/form-data">
+      <div class="setup-step"><span>1</span><div><strong>Unternehmen und Logo</strong>
+      <small>Pflichtangaben für den Dokumentkopf</small></div></div>
+      <div class="form-grid">
+        <label class="wide"><span>Logo (PNG, JPG oder WebP; maximal 5 MB)</span>
+          {logo_preview}
+          <input type="file" name="logo" accept="image/png,image/jpeg,image/webp">
+        </label>
+        <label><span>Unternehmensname *</span><input required name="company_name" value="{h(settings.get('company_name'))}"></label>
+        <label><span>Inhaber / Geschäftsführung *</span><input required name="owner_name" value="{h(settings.get('owner_name'))}"></label>
+        <label class="wide"><span>Straße und Hausnummer *</span><input required name="street" value="{h(settings.get('street'))}"></label>
+        <label><span>PLZ *</span><input required name="postal_code" value="{h(settings.get('postal_code'))}"></label>
+        <label><span>Ort *</span><input required name="city" value="{h(settings.get('city'))}"></label>
+        <label><span>Land</span><input name="country" value="{h(settings.get('country', 'Deutschland'))}"></label>
+        <label><span>Telefon</span><input name="phone" value="{h(settings.get('phone'))}"></label>
+        <label><span>E-Mail *</span><input required type="email" name="email" value="{h(settings.get('email'))}"></label>
+        <label><span>Website</span><input name="website" value="{h(settings.get('website'))}"></label>
+      </div>
+
+      <div class="setup-step"><span>2</span><div><strong>Steuern, Zahlung und Nummernkreise</strong>
+      <small>Die Zähler bezeichnen jeweils die zuletzt vergebene Nummer</small></div></div>
+      <div class="form-grid">
+        <label><span>Steuernummer</span><input name="tax_number" value="{h(settings.get('tax_number'))}"></label>
+        <label><span>Zahlungsziel in Tagen *</span><input required type="number" min="0" max="365" name="payment_terms_days" value="{h(settings.get('payment_terms_days', '14'))}"></label>
+        <label><span>Bank</span><input name="bank_name" value="{h(settings.get('bank_name'))}"></label>
+        <label><span>IBAN</span><input name="iban" value="{h(settings.get('iban'))}"></label>
+        <label><span>BIC</span><input name="bic" value="{h(settings.get('bic'))}"></label>
+        <label><span>Letzte Rechnungs-/Gutschriftnummer *</span><input required type="number" min="0" name="invoice_counter" value="{h(settings.get('invoice_counter', '0'))}"></label>
+        <label><span>Letzte Kundennummer *</span><input required type="number" min="0" name="customer_counter" value="{h(settings.get('customer_counter', '0'))}"></label>
+        <label><span>Letzte Angebotsnummer *</span><input required type="number" min="0" name="offer_counter" value="{h(settings.get('offer_counter', '0'))}"></label>
+        <label><span>Letzte Auftragsnummer *</span><input required type="number" min="0" name="order_counter" value="{h(settings.get('order_counter', '0'))}"></label>
+        <label class="check wide"><input type="checkbox" name="small_business_enabled" {checked}>
+          <span>Kleinunternehmerregelung nach § 19 UStG verwenden</span></label>
+        <label class="wide"><span>Hinweis auf Rechnungen</span>
+          <input name="small_business_notice" value="{h(settings.get('small_business_notice'))}"></label>
+      </div>
+
+      <div class="setup-step"><span>3</span><div><strong>Microsoft Graph (optional)</strong>
+      <small>Kann später jederzeit in den Einstellungen ergänzt werden</small></div></div>
+      <div class="form-grid">
+        <label><span>Microsoft Tenant-ID</span><input name="graph_tenant_id" value="{h(settings.get('graph_tenant_id'))}"></label>
+        <label><span>Microsoft Client-ID</span><input name="graph_client_id" value="{h(settings.get('graph_client_id'))}"></label>
+        <label class="wide"><span>Absenderadresse</span><input type="email" name="graph_sender" value="{h(settings.get('graph_sender') or settings.get('email'))}"></label>
+      </div>
+      <div class="setup-submit">
+        <p>Nach dem Speichern öffnet sich die leere Buchhaltungsoberfläche.</p>
+        <button class="button primary" type="submit">Einrichtung abschließen</button>
+      </div>
+    </form>
+  </main>
+</body>
+</html>"""
+
+
+def response(start_response, body: str | bytes, status=200, headers=None, content_type="text/html; charset=utf-8"):
+    raw = body.encode("utf-8") if isinstance(body, str) else body
+    all_headers = [("Content-Type", content_type), ("Content-Length", str(len(raw)))]
+    all_headers.extend(headers or [])
+    start_response(f"{status} {HTTPStatus(status).phrase}", all_headers)
+    return [raw]
+
+
+def redirect(start_response, target: str, message: str = "", level: str = "success"):
+    headers = []
+    if message:
+        headers.append(("Set-Cookie", flash_cookie(message, level)))
+    safe_target = json.dumps(target.lstrip("/"))
+    body = f"""<!doctype html><html lang="de"><head><meta charset="utf-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <title>Weiterleitung</title></head><body>
+    <p>Die Anwendung wird geöffnet …</p>
+    <script>
+    (() => {{
+      const marker = "/api/hassio_ingress/";
+      const path = window.location.pathname;
+      const markerPos = path.indexOf(marker);
+      let root = "/";
+      if (markerPos >= 0) {{
+        const afterMarker = markerPos + marker.length;
+        const tokenEnd = path.indexOf("/", afterMarker);
+        root = tokenEnd >= 0 ? path.slice(0, tokenEnd + 1) : path + "/";
+      }}
+      window.location.replace(root + {safe_target});
+    }})();
+    </script></body></html>"""
+    return response(start_response, body, 200, headers)
+
+
+def rows(connection, query: str, params=()):
+    return [dict(row) for row in connection.execute(query, params)]
+
+
+def fetch_document(connection, document_id: int):
+    row = connection.execute(
+        """
+        SELECT d.*, c.company, c.customer_number, c.email AS customer_email
+        FROM documents d JOIN customers c ON c.id=d.customer_id WHERE d.id=?
+        """,
+        (document_id,),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def dashboard(connection) -> str:
+    stats = {
+        "customers": connection.execute("SELECT count(*) FROM customers").fetchone()[0],
+        "open": connection.execute(
+            "SELECT count(*) FROM documents WHERE document_type='invoice' AND status IN ('final','sent')"
+        ).fetchone()[0],
+        "paid": connection.execute(
+            "SELECT COALESCE(sum(total_cents),0) FROM documents WHERE document_type='invoice' AND status='paid' AND substr(issue_date,1,4)=?",
+            (str(date.today().year),),
+        ).fetchone()[0],
+        "outstanding": connection.execute(
+            "SELECT COALESCE(sum(total_cents),0) FROM documents WHERE document_type='invoice' AND status IN ('final','sent')"
+        ).fetchone()[0],
+    }
+    recent = rows(
+        connection,
+        """
+        SELECT d.*, c.company FROM documents d JOIN customers c ON c.id=d.customer_id
+        ORDER BY d.created_at DESC LIMIT 8
+        """,
+    )
+    recent_rows = "".join(
+        f"""<tr><td><a href="/document/{d['id']}">{h(d['document_number'] or 'Entwurf')}</a></td>
+        <td>{h(TYPE_LABELS[d['document_type']])}</td><td>{h(d['company'])}</td>
+        <td>{german_date(d['issue_date'])}</td><td class="money">{money(d['total_cents'])}</td>
+        <td><span class="status {h(d['status'])}">{h(DOCUMENT_STATUS.get(d['status'], d['status']))}</span></td></tr>"""
+        for d in recent
+    ) or '<tr><td colspan="6" class="empty">Noch keine Dokumente vorhanden.</td></tr>'
+    return f"""
+    <div class="actions"><a class="button primary" href="/document/new?type=invoice">Neue Rechnung</a>
+    <a class="button" href="/document/new?type=offer">Neues Angebot</a></div>
+    <div class="stats">
+      <article><span>Kunden</span><strong>{stats['customers']}</strong></article>
+      <article><span>Offene Rechnungen</span><strong>{stats['open']}</strong></article>
+      <article><span>Offener Betrag</span><strong>{money(stats['outstanding'])}</strong></article>
+      <article><span>Bezahlt {date.today().year}</span><strong>{money(stats['paid'])}</strong></article>
+    </div>
+    <div class="card"><div class="card-head"><h2>Letzte Dokumente</h2></div>
+    <div class="table-wrap"><table><thead><tr><th>Nummer</th><th>Art</th><th>Kunde</th>
+    <th>Datum</th><th>Betrag</th><th>Status</th></tr></thead><tbody>{recent_rows}</tbody></table></div></div>
+    """
+
+
+def customers_page(connection) -> str:
+    customers = rows(
+        connection,
+        """
+        SELECT c.*,
+          (SELECT count(*) FROM documents d WHERE d.customer_id=c.id) current_count,
+          (SELECT count(*) FROM archive_files a WHERE a.customer_id=c.id) archive_count
+        FROM customers c ORDER BY c.company
+        """,
+    )
+    customer_rows = "".join(
+        f"""<tr><td><a href="/customer/{c['id']}"><strong>{h(c['customer_number'])}</strong></a></td>
+        <td><a href="/customer/{c['id']}">{h(c['company'])}</a></td>
+        <td>{h(c['contact_name'])}</td><td>{h(c['email'])}</td>
+        <td>{c['current_count'] + c['archive_count']}</td>
+        <td><a class="button compact" href="/customer/{c['id']}">Kundenakte</a></td></tr>"""
+        for c in customers
+    ) or '<tr><td colspan="6" class="empty">Noch keine Kunden angelegt.</td></tr>'
+    return f"""
+    <div class="actions"><a class="button primary" href="/customer/new">Kunde anlegen</a></div>
+    <div class="card"><div class="table-wrap"><table><thead><tr><th>Kundennummer</th><th>Unternehmen</th>
+    <th>Ansprechpartner</th><th>Rechnungs-E-Mail</th><th>Dokumente</th><th></th></tr></thead>
+    <tbody>{customer_rows}</tbody></table></div></div>"""
+
+
+def customer_form(customer=None) -> str:
+    customer = dict(customer or {})
+    editing = bool(customer)
+    action = f"/customer/{customer['id']}/edit" if editing else "/customer/new"
+    return f"""
+    <form class="card form" method="post" action="{action}">
+      <div class="form-grid">
+        <label><span>Unternehmen *</span><input required name="company" value="{h(customer.get('company'))}"></label>
+        <label><span>Ansprechpartner</span><input name="contact_name" value="{h(customer.get('contact_name'))}"></label>
+        <label class="wide"><span>Straße *</span><input required name="street" value="{h(customer.get('street'))}"></label>
+        <label><span>PLZ *</span><input required name="postal_code" value="{h(customer.get('postal_code'))}"></label>
+        <label><span>Ort *</span><input required name="city" value="{h(customer.get('city'))}"></label>
+        <label><span>Land</span><input name="country" value="{h(customer.get('country', 'Deutschland'))}"></label>
+        <label><span>Rechnungs-E-Mail</span><input type="email" name="email" value="{h(customer.get('email'))}"></label>
+        <label><span>Buyer Reference</span><input name="buyer_reference" value="{h(customer.get('buyer_reference'))}"></label>
+        <label class="wide"><span>Notizen</span><textarea name="notes">{h(customer.get('notes'))}</textarea></label>
+      </div>
+      <div class="form-actions"><a class="button" href="/customers">Abbrechen</a>
+      <button class="button primary">{'Änderungen speichern' if editing else 'Kunde speichern'}</button></div>
+    </form>"""
+
+
+def customer_detail(connection, customer_id: int) -> str:
+    customer = connection.execute("SELECT * FROM customers WHERE id=?", (customer_id,)).fetchone()
+    if not customer:
+        raise ValueError("Kunde wurde nicht gefunden.")
+    documents = rows(
+        connection,
+        "SELECT * FROM documents WHERE customer_id=? ORDER BY issue_date DESC, id DESC",
+        (customer_id,),
+    )
+    archive = rows(
+        connection,
+        "SELECT * FROM archive_files WHERE customer_id=? ORDER BY detected_issue_date DESC, id DESC",
+        (customer_id,),
+    )
+    document_rows = "".join(
+        f"""<tr><td><a href="/document/{d['id']}">{h(d['document_number'] or 'Entwurf')}</a></td>
+        <td>{h(TYPE_LABELS[d['document_type']])}</td><td>{german_date(d['issue_date'])}</td>
+        <td class="money">{money(d['total_cents'])}</td>
+        <td><span class="status {h(d['status'])}">{h(DOCUMENT_STATUS.get(d['status'], d['status']))}</span></td></tr>"""
+        for d in documents
+    )
+    document_rows += "".join(
+        f"""<tr><td><a href="/archive/{a['id']}">{h(a['detected_invoice_number'] or a['original_filename'])}</a></td>
+        <td>Archiv-Rechnung</td><td>{german_date(a['detected_issue_date']) if a['detected_issue_date'] else '–'}</td>
+        <td class="money">{money(a['detected_amount_cents']) if a['detected_amount_cents'] is not None else '–'}</td>
+        <td><a class="button compact" target="_blank" href="/archive/{a['id']}/pdf">PDF öffnen</a></td></tr>"""
+        for a in archive
+    )
+    if not document_rows:
+        document_rows = '<tr><td colspan="5" class="empty">Noch keine Dokumente für diesen Kunden.</td></tr>'
+
+    templates = rows(
+        connection,
+        """
+        SELECT r.*, rr.period AS last_period, rr.status AS last_status, rr.error AS last_error
+        FROM recurring_invoices r
+        LEFT JOIN recurring_runs rr ON rr.id=(
+          SELECT id FROM recurring_runs WHERE recurring_invoice_id=r.id ORDER BY period DESC LIMIT 1
+        )
+        WHERE r.customer_id=? ORDER BY r.id
+        """,
+        (customer_id,),
+    )
+    template_rows = "".join(
+        f"""<tr><td>{h(r['description'])}</td><td class="money">{money(r['unit_price_cents'])}</td>
+        <td>am {r['billing_day']}. des Monats</td>
+        <td>{'Ja' if r['auto_send'] else 'Nein'}</td>
+        <td><span class="status {'paid' if r['active'] else 'cancelled'}">{'Aktiv' if r['active'] else 'Pausiert'}</span></td>
+        <td><div class="row-actions"><form method="post" action="/recurring/{r['id']}/run">
+        <button class="button compact">Jetzt erzeugen</button></form>
+        <form method="post" action="/recurring/{r['id']}/toggle">
+        <button class="button compact">{'Pausieren' if r['active'] else 'Aktivieren'}</button></form></div></td></tr>"""
+        for r in templates
+    ) or '<tr><td colspan="6" class="empty">Noch keine monatliche Rechnung eingerichtet.</td></tr>'
+    email_note = (
+        f'<a href="mailto:{h(customer["email"])}">{h(customer["email"])}</a>'
+        if customer["email"] else '<span class="status cancelled">Noch keine Rechnungs-E-Mail hinterlegt</span>'
+    )
+    return f"""
+    <div class="actions"><a class="button" href="/customer/{customer_id}/edit">Kundendaten bearbeiten</a>
+    <a class="button primary" href="/document/new?type=invoice&customer={customer_id}">Neue Rechnung</a></div>
+    <div class="card customer-profile"><div><span>Kundennummer</span><strong>{h(customer['customer_number'])}</strong></div>
+    <div><span>Unternehmen</span><strong>{h(customer['company'])}</strong></div>
+    <div><span>Ansprechpartner</span><strong>{h(customer['contact_name'] or '–')}</strong></div>
+    <div><span>Rechnungs-E-Mail</span><strong>{email_note}</strong></div>
+    <div><span>Anschrift</span><strong>{h(customer['street'])}<br>{h(customer['postal_code'])} {h(customer['city'])}</strong></div></div>
+    <div class="card"><div class="card-head"><h2>Dokumente und importierte Rechnungen</h2></div>
+    <div class="table-wrap"><table><thead><tr><th>Nummer</th><th>Art</th><th>Datum</th><th>Betrag</th><th>Status</th></tr></thead>
+    <tbody>{document_rows}</tbody></table></div></div>
+    <div class="card"><div class="card-head split-head"><div><h2>Monatliche Rechnungen</h2>
+    <p class="muted">Automatische Läufe erfolgen einmal pro Stunde und erzeugen je Vorlage höchstens eine Rechnung pro Monat.</p></div>
+    <a class="button primary" href="/customer/{customer_id}/recurring/new">Dauerrechnung anlegen</a></div>
+    <div class="table-wrap"><table><thead><tr><th>Leistung</th><th>Betrag</th><th>Lauf</th><th>Auto-Versand</th><th>Status</th><th></th></tr></thead>
+    <tbody>{template_rows}</tbody></table></div></div>"""
+
+
+def documents_page(connection, doc_type: str) -> str:
+    if doc_type not in TYPE_LABELS:
+        doc_type = "invoice"
+    documents = rows(
+        connection,
+        """
+        SELECT d.*, c.company FROM documents d JOIN customers c ON c.id=d.customer_id
+        WHERE d.document_type=? ORDER BY d.issue_date DESC, d.id DESC
+        """,
+        (doc_type,),
+    )
+    document_rows = "".join(
+        f"""<tr><td><a href="/document/{d['id']}">{h(d['document_number'] or 'Entwurf')}</a></td>
+        <td>{german_date(d['issue_date'])}</td><td>{h(d['company'])}</td>
+        <td>{h(d['title'])}</td><td class="money">{money(d['total_cents'])}</td>
+        <td><span class="status {h(d['status'])}">{h(DOCUMENT_STATUS.get(d['status'], d['status']))}</span></td></tr>"""
+        for d in documents
+    ) or f'<tr><td colspan="6" class="empty">Noch keine {h(TYPE_LABELS[doc_type])}-Dokumente vorhanden.</td></tr>'
+    return f"""
+    <div class="actions"><a class="button primary" href="/document/new?type={doc_type}">
+    {h(TYPE_LABELS[doc_type])} erstellen</a></div>
+    <div class="card"><div class="table-wrap"><table><thead><tr><th>Nummer</th><th>Datum</th>
+    <th>Kunde</th><th>Betreff</th><th>Betrag</th><th>Status</th></tr></thead>
+    <tbody>{document_rows}</tbody></table></div></div>"""
+
+
+def document_form(
+    connection, doc_type: str, source_id: int | None = None,
+    preferred_customer_id: int | None = None,
+) -> str:
+    customers = rows(connection, "SELECT * FROM customers ORDER BY company")
+    if not customers:
+        return '<div class="empty-state"><h2>Zuerst einen Kunden anlegen</h2><p>Für ein Dokument wird mindestens ein Kunde benötigt.</p><a class="button primary" href="/customer/new">Kunde anlegen</a></div>'
+    source = fetch_document(connection, source_id) if source_id else None
+    source_items = rows(
+        connection, "SELECT * FROM document_items WHERE document_id=? ORDER BY position", (source_id,)
+    ) if source else []
+    customer_options = "".join(
+        f'<option value="{c["id"]}" {"selected" if (source and c["id"] == source["customer_id"]) or (not source and c["id"] == preferred_customer_id) else ""}>{h(c["company"])} ({h(c["customer_number"])})</option>'
+        for c in customers
+    )
+    item = source_items[0] if source_items else {}
+    today = date.today().isoformat()
+    title = source["title"] if source else ""
+    return f"""
+    <form class="card form" method="post" action="/document/new">
+      <input type="hidden" name="document_type" value="{h(doc_type)}">
+      <input type="hidden" name="source_document_id" value="{h(source_id or '')}">
+      <div class="form-grid">
+        <label><span>Kunde *</span><select required name="customer_id">{customer_options}</select></label>
+        <label><span>Dokumentdatum *</span><input required type="date" name="issue_date" value="{today}"></label>
+        <label class="wide"><span>Betreff</span><input name="title" value="{h(title)}" placeholder="z. B. Hosting Services – Virtuelle Webserver"></label>
+        <label><span>Leistungsbeginn</span><input type="date" name="service_start"></label>
+        <label><span>Leistungsende</span><input type="date" name="service_end"></label>
+      </div>
+      <h3>Erste Position</h3>
+      <div class="form-grid">
+        <label><span>Kategorie</span><input name="category" value="{h(item.get('category', ''))}" placeholder="Hosting Services"></label>
+        <label class="wide"><span>Beschreibung *</span><input required name="description" value="{h(item.get('description', ''))}"></label>
+        <label><span>Zeitraum</span><input name="service_period" value="{h(item.get('service_period', ''))}" placeholder="01.07.2026–30.09.2026"></label>
+        <label><span>Menge</span><input name="quantity" value="1"></label>
+        <label><span>Einheit</span><input name="unit" value="{h(item.get('unit', 'pauschal'))}"></label>
+        <label><span>Einzelpreis in EUR *</span><input required name="unit_price" inputmode="decimal" value="{h(str(Decimal(item.get('unit_price_cents', 0))/100).replace('.', ',') if item else '')}"></label>
+        <label class="wide"><span>Hinweise</span><textarea name="notes"></textarea></label>
+      </div>
+      <div class="form-actions"><a class="button" href="/documents?type={h(doc_type)}">Abbrechen</a>
+      <button class="button primary">Als Entwurf speichern</button></div>
+    </form>"""
+
+
+def document_detail(connection, document_id: int) -> str:
+    document = fetch_document(connection, document_id)
+    if not document:
+        return '<div class="alert error">Dokument nicht gefunden.</div>'
+    items = rows(connection, "SELECT * FROM document_items WHERE document_id=? ORDER BY position", (document_id,))
+    item_rows = "".join(
+        f"<tr><td>{i['position']}</td><td>{h(i['description'])}</td><td>{h(i['service_period'])}</td>"
+        f"<td class='money'>{money(i['unit_price_cents'])}</td><td class='money'>{money(i['total_cents'])}</td></tr>"
+        for i in items
+    )
+    actions = []
+    if document["status"] == "draft":
+        actions.append(f'<form method="post" action="/document/{document_id}/finalize"><button class="button primary">Fertigstellen & PDF erzeugen</button></form>')
+    if document["status"] in ("final", "sent"):
+        actions.append(f'<a class="button" href="/document/{document_id}/pdf">PDF öffnen</a>')
+        if document["customer_email"]:
+            actions.append(f'<form method="post" action="/document/{document_id}/send"><button class="button">Per E-Mail senden</button></form>')
+    if document["document_type"] == "offer" and document["status"] in ("final", "sent"):
+        actions.append(f'<form method="post" action="/document/{document_id}/convert?to=order"><button class="button primary">Als Auftrag bestätigen</button></form>')
+    if document["document_type"] == "order" and document["status"] in ("final", "sent", "accepted"):
+        actions.append(f'<form method="post" action="/document/{document_id}/convert?to=invoice"><button class="button primary">Rechnung erstellen</button></form>')
+    if document["document_type"] == "invoice" and document["status"] in ("final", "sent"):
+        actions.append(f'<form method="post" action="/document/{document_id}/paid"><button class="button primary">Als bezahlt markieren</button></form>')
+    settings = DB.settings()
+    tax_notice = (
+        f'<p class="notice">{h(settings.get("small_business_notice"))}</p>'
+        if settings.get("small_business_enabled", "1") == "1"
+        and settings.get("small_business_notice")
+        else ""
+    )
+    return f"""
+    <div class="actions inline-actions">{''.join(actions)}</div>
+    <div class="document-sheet">
+      <div class="document-head"><div><span>{h(TYPE_LABELS[document['document_type']])}</span>
+      <h2>{h(document['document_number'] or 'Entwurf')}</h2></div>
+      <span class="status {h(document['status'])}">{h(DOCUMENT_STATUS.get(document['status']))}</span></div>
+      <div class="document-meta"><div><span>Kunde</span><strong>{h(document['company'])}</strong></div>
+      <div><span>Datum</span><strong>{german_date(document['issue_date'])}</strong></div>
+      <div><span>Betreff</span><strong>{h(document['title'])}</strong></div></div>
+      <table><thead><tr><th>Pos.</th><th>Leistung</th><th>Zeitraum</th><th>Einzelpreis</th><th>Gesamt</th></tr></thead>
+      <tbody>{item_rows}</tbody></table>
+      <div class="grand-total"><span>Gesamtbetrag</span><strong>{money(document['total_cents'])}</strong></div>
+      {tax_notice}
+    </div>"""
+
+
+def next_number(connection, document_type: str, issue_date: str) -> str:
+    counter_key = {
+        "invoice": "invoice_counter",
+        "credit": "invoice_counter",
+        "offer": "offer_counter",
+        "order": "order_counter",
+    }[document_type]
+    current = int(connection.execute("SELECT value FROM settings WHERE key=?", (counter_key,)).fetchone()[0])
+    value = current + 1
+    connection.execute("UPDATE settings SET value=? WHERE key=?", (str(value), counter_key))
+    prefix = {"invoice": "", "credit": "GS-", "offer": "AN-", "order": "AB-"}[document_type]
+    return f"{prefix}{issue_date[:7]}-{value:04d}"
+
+
+def finalize_document(connection, document_id: int):
+    document = fetch_document(connection, document_id)
+    if not document or document["status"] != "draft":
+        raise ValueError("Nur Entwürfe können fertiggestellt werden.")
+    number = next_number(connection, document["document_type"], document["issue_date"])
+    finalized_at = Database.now()
+    connection.execute(
+        "UPDATE documents SET document_number=?, status='final', finalized_at=?, updated_at=? WHERE id=?",
+        (number, finalized_at, finalized_at, document_id),
+    )
+    Database.audit(connection, "document", document_id, "finalized", number)
+    generate_pdf(connection, document_id)
+    return number
+
+
+def generate_pdf(connection, document_id: int) -> Path:
+    document = fetch_document(connection, document_id)
+    customer = dict(connection.execute("SELECT * FROM customers WHERE id=?", (document["customer_id"],)).fetchone())
+    items = rows(connection, "SELECT * FROM document_items WHERE document_id=? ORDER BY position", (document_id,))
+    settings = DB.settings()
+    safe_number = re.sub(r"[^A-Za-z0-9._-]", "_", document["document_number"])
+    output = DATA_DIR / "documents" / f"{safe_number}.pdf"
+    create_document_pdf(
+        output,
+        document,
+        customer,
+        items,
+        settings,
+        COMPANY_LOGO if COMPANY_LOGO.is_file() else None,
+    )
+    return output
+
+
+MONTH_NAMES = [
+    "", "Januar", "Februar", "März", "April", "Mai", "Juni",
+    "Juli", "August", "September", "Oktober", "November", "Dezember",
+]
+
+
+def recurring_form(connection, customer_id: int) -> str:
+    customer = connection.execute("SELECT * FROM customers WHERE id=?", (customer_id,)).fetchone()
+    if not customer:
+        raise ValueError("Kunde wurde nicht gefunden.")
+    warning = (
+        ""
+        if customer["email"] else
+        '<div class="alert error">Für automatischen Versand muss zuerst eine Rechnungs-E-Mail beim Kunden hinterlegt werden.</div>'
+    )
+    return f"""
+    {warning}
+    <form class="card form" method="post" action="/customer/{customer_id}/recurring/new">
+      <h2>Monatliche Rechnung für {h(customer['company'])}</h2>
+      <div class="form-grid">
+        <label><span>Rechnungstag (1–28)</span><input required type="number" min="1" max="28" name="billing_day" value="1"></label>
+        <label><span>Betreff</span><input name="title" placeholder="Hosting Services"></label>
+        <label><span>Kategorie</span><input name="category" placeholder="Hosting"></label>
+        <label class="wide"><span>Leistungsbeschreibung *</span><input required name="description" placeholder="Virtueller Webserver"></label>
+        <label class="wide"><span>Leistungszeitraum</span><input name="service_period_template" value="{{monat}} {{jahr}}">
+        <small class="muted">Platzhalter: {{monat}}, {{monat_nummer}} und {{jahr}}</small></label>
+        <label><span>Menge</span><input name="quantity" value="1"></label>
+        <label><span>Einheit</span><input name="unit" value="pauschal"></label>
+        <label><span>Einzelpreis in EUR *</span><input required name="unit_price" inputmode="decimal"></label>
+        <label class="check"><input type="checkbox" name="auto_finalize" checked><span>Automatisch fertigstellen und PDF erzeugen</span></label>
+        <label class="check"><input type="checkbox" name="auto_send" {'disabled' if not customer['email'] else ''}>
+        <span>PDF automatisch an die Rechnungs-E-Mail versenden</span></label>
+      </div>
+      <div class="form-actions"><a class="button" href="/customer/{customer_id}">Abbrechen</a>
+      <button class="button primary">Dauerrechnung speichern</button></div>
+    </form>"""
+
+
+def send_document_email(connection, document_id: int):
+    document = fetch_document(connection, document_id)
+    if not document or document["status"] not in ("final", "sent"):
+        raise ValueError("Nur fertiggestellte Dokumente können versendet werden.")
+    if not document["customer_email"]:
+        raise ValueError("Beim Kunden ist keine Rechnungs-E-Mail hinterlegt.")
+    pdf = generate_pdf(connection, document_id)
+    settings = DB.settings()
+    company_name = settings.get("company_name", "")
+    closing_name = settings.get("owner_name") or company_name
+    subject = (
+        f"{TYPE_LABELS[document['document_type']]} "
+        f"{document['document_number']} von {company_name}"
+    )
+    body_html = (
+        f"<p>Guten Tag,</p><p>anbei erhalten Sie {TYPE_LABELS[document['document_type']].lower()} "
+        f"{h(document['document_number'])}.</p><p>Mit freundlichen Grüßen<br>{h(closing_name)}</p>"
+    )
+    status = GraphClient(settings).send_pdf(
+        document["customer_email"], subject, body_html, pdf.name, pdf.read_bytes()
+    )
+    now = Database.now()
+    connection.execute(
+        "UPDATE documents SET status='sent', sent_at=?, updated_at=? WHERE id=?",
+        (now, now, document_id),
+    )
+    connection.execute(
+        """
+        INSERT INTO mail_log(document_id, recipient, subject, status, response_code, sent_at)
+        VALUES (?, ?, ?, 'sent', ?, ?)
+        """,
+        (document_id, document["customer_email"], subject, str(status), now),
+    )
+    Database.audit(connection, "document", document_id, "sent", document["customer_email"])
+
+
+def run_recurring_invoice(connection, recurring_id: int, run_date: date, manual: bool = False):
+    template = connection.execute(
+        """
+        SELECT r.*, c.email AS customer_email FROM recurring_invoices r
+        JOIN customers c ON c.id=r.customer_id WHERE r.id=?
+        """,
+        (recurring_id,),
+    ).fetchone()
+    if not template:
+        raise ValueError("Dauerrechnung wurde nicht gefunden.")
+    if not manual and (not template["active"] or run_date.day < template["billing_day"]):
+        return None
+    period = run_date.strftime("%Y-%m")
+    now = Database.now()
+    try:
+        run_id = connection.execute(
+            """
+            INSERT INTO recurring_runs(recurring_invoice_id, period, status, created_at, updated_at)
+            VALUES (?, ?, 'processing', ?, ?)
+            """,
+            (recurring_id, period, now, now),
+        ).lastrowid
+    except sqlite3.IntegrityError:
+        return None
+
+    last_day = calendar.monthrange(run_date.year, run_date.month)[1]
+    service_start = date(run_date.year, run_date.month, 1)
+    service_end = date(run_date.year, run_date.month, last_day)
+    period_text = template["service_period_template"].format(
+        monat=MONTH_NAMES[run_date.month],
+        monat_nummer=f"{run_date.month:02d}",
+        jahr=run_date.year,
+    )
+    terms = int(DB.settings()["payment_terms_days"])
+    due_date = (run_date + timedelta(days=terms)).isoformat()
+    qty = template["quantity_milli"]
+    total = int((Decimal(qty) / 1000 * template["unit_price_cents"]).quantize(Decimal("1")))
+    document_id = connection.execute(
+        """
+        INSERT INTO documents(document_type, status, customer_id, issue_date, service_start,
+        service_end, due_date, payment_terms_days, title, total_cents, created_at, updated_at)
+        VALUES ('invoice', 'draft', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            template["customer_id"], run_date.isoformat(), service_start.isoformat(),
+            service_end.isoformat(), due_date, terms, template["title"], total, now, now,
+        ),
+    ).lastrowid
+    connection.execute(
+        """
+        INSERT INTO document_items(document_id, position, category, description, quantity_milli,
+        unit, unit_price_cents, total_cents, service_period)
+        VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            document_id, template["category"], template["description"], qty, template["unit"],
+            template["unit_price_cents"], total, period_text,
+        ),
+    )
+    status = "draft_created"
+    error = ""
+    try:
+        if template["auto_finalize"] or template["auto_send"]:
+            finalize_document(connection, document_id)
+            status = "finalized"
+        if template["auto_send"]:
+            send_document_email(connection, document_id)
+            status = "sent"
+    except Exception as exc:
+        status = "send_failed"
+        error = str(exc)
+    connection.execute(
+        """
+        UPDATE recurring_runs SET document_id=?, status=?, error=?, updated_at=? WHERE id=?
+        """,
+        (document_id, status, error, Database.now(), run_id),
+    )
+    Database.audit(connection, "recurring_invoice", recurring_id, status, period)
+    return document_id, status, error
+
+
+def process_due_recurring():
+    try:
+        with DB.connect() as connection:
+            ids = [
+                row["id"] for row in connection.execute(
+                    "SELECT id FROM recurring_invoices WHERE active=1 AND billing_day<=?",
+                    (date.today().day,),
+                )
+            ]
+            for recurring_id in ids:
+                run_recurring_invoice(connection, recurring_id, date.today())
+    except Exception as exc:
+        print(f"Dauerrechnungsprüfung fehlgeschlagen: {exc}", flush=True)
+
+
+def recurring_worker():
+    time.sleep(30)
+    while True:
+        process_due_recurring()
+        time.sleep(3600)
+
+
+def archive_page(connection) -> str:
+    files = rows(
+        connection,
+        """
+        SELECT a.*, d.document_number, c.company AS imported_customer FROM archive_files a
+        LEFT JOIN customers c ON c.id=a.customer_id
+        LEFT JOIN documents d ON d.id=a.document_id
+        ORDER BY a.uploaded_at DESC
+        """,
+    )
+    file_rows = "".join(
+        f"<tr><td><strong>{h(f['original_filename'])}</strong></td>"
+        f"<td>{h(f['detected_invoice_number'] or f['document_number'] or 'Noch nicht erkannt')}</td>"
+        f"<td>{h(f['detected_customer_name'] or '–')}"
+        f"{f'<br><small>Kd.-Nr. {h(f['detected_customer_number'])}</small>' if f['detected_customer_number'] else ''}</td>"
+        f"<td>{german_date(f['detected_issue_date']) if f['detected_issue_date'] else '–'}</td>"
+        f"<td class='money'>{money(f['detected_amount_cents']) if f['detected_amount_cents'] is not None else '–'}</td>"
+        f"<td><div class='row-actions'><a class='button compact' href='/archive/{f['id']}'>Prüfen</a>"
+        f"<a class='button compact' target='_blank' href='/archive/{f['id']}/pdf'>Öffnen</a>"
+        f"<form method='post' action='/archive/{f['id']}/analyze'><button class='button compact'>Neu analysieren</button></form>"
+        f"</div></td></tr>"
+        for f in files
+    ) or '<tr><td colspan="6" class="empty">Noch keine alten Rechnungen importiert.</td></tr>'
+    return f"""
+    <div class="card form">
+      <h2>Alte PDF-Rechnung importieren</h2>
+      <p class="muted">Die Originaldatei bleibt unverändert. Nummer, Datum, Betrag und Kundenanschrift werden automatisch ausgelesen.</p>
+      <form method="post" action="/archive/upload" enctype="multipart/form-data">
+      <div class="form-grid"><label class="wide"><span>PDF-Datei *</span><input required type="file" name="pdf" accept="application/pdf"></label>
+      <label><span>Rechnungsnummer</span><input name="document_number" placeholder="2026-06-0132"></label>
+      <label><span>Rechnungsdatum</span><input type="date" name="issue_date"></label>
+      <label><span>Betrag in EUR</span><input name="amount" inputmode="decimal"></label></div>
+      <div class="form-actions"><button class="button primary">Hochladen und analysieren</button></div></form>
+    </div>
+    <div class="card"><div class="table-wrap"><table><thead><tr><th>Datei</th><th>Nummer</th><th>Kunde</th><th>Datum</th><th>Betrag</th><th>Aktionen</th></tr></thead>
+    <tbody>{file_rows}</tbody></table></div></div>"""
+
+
+def archive_detail(connection, archive_id: int) -> str:
+    item = connection.execute(
+        """
+        SELECT a.*, c.company AS imported_customer, c.customer_number
+        FROM archive_files a LEFT JOIN customers c ON c.id=a.customer_id
+        WHERE a.id=?
+        """,
+        (archive_id,),
+    ).fetchone()
+    if not item:
+        raise ValueError("Archivdatei wurde nicht gefunden.")
+    amount_value = (
+        f"{item['detected_amount_cents'] / 100:.2f}".replace(".", ",")
+        if item["detected_amount_cents"] is not None else ""
+    )
+    state = (
+        f'<div class="alert success">Als Kunde {h(item["customer_number"])} · '
+        f'{h(item["imported_customer"])} übernommen.</div>'
+        if item["customer_id"] else ""
+    )
+    warning = (
+        f'<div class="alert error">{h(item["analysis_error"])}</div>'
+        if item["analysis_error"] else ""
+    )
+    customer_button = (
+        ""
+        if item["customer_id"] else
+        f"""<button class="button primary" type="submit"
+        form="archive-customer-import">Kundendaten übernehmen</button>"""
+    )
+    return f"""
+    {state}{warning}
+    <form id="archive-customer-import" method="post" action="/archive/{archive_id}/customer"></form>
+    <div class="actions">
+      <a class="button" target="_blank" href="/archive/{archive_id}/pdf">Original-PDF öffnen</a>
+      <form method="post" action="/archive/{archive_id}/analyze"><button class="button">Neu analysieren</button></form>
+    </div>
+    <form class="card form" method="post" action="/archive/{archive_id}/metadata">
+      <h2>Erkannte Daten prüfen</h2>
+      <p class="muted">Korrigiere die Felder bei Bedarf, bevor du den Kunden übernimmst.</p>
+      <div class="form-grid">
+        <label><span>Rechnungsnummer</span><input name="invoice_number" value="{h(item['detected_invoice_number'])}"></label>
+        <label><span>Rechnungsdatum</span><input type="date" name="issue_date" value="{h(item['detected_issue_date'])}"></label>
+        <label><span>Rechnungsbetrag in EUR</span><input name="amount" value="{h(amount_value)}"></label>
+        <label><span>Unternehmen / Kunde *</span><input name="customer_name" value="{h(item['detected_customer_name'])}"></label>
+        <label><span>Erkannte Kundennummer</span><input name="customer_number" value="{h(item['detected_customer_number'])}"></label>
+        <label><span>Straße</span><input name="street" value="{h(item['detected_street'])}"></label>
+        <label><span>PLZ</span><input name="postal_code" value="{h(item['detected_postal_code'])}"></label>
+        <label><span>Ort</span><input name="city" value="{h(item['detected_city'])}"></label>
+      </div>
+      <div class="form-actions"><button class="button">Korrekturen speichern</button>{customer_button}</div>
+    </form>
+    <details class="card extracted"><summary>Erkannten PDF-Text anzeigen</summary>
+      <pre>{h(item['extracted_text'])}</pre>
+    </details>"""
+
+
+def update_archive_analysis(connection, archive_id: int, result: dict):
+    connection.execute(
+        """
+        UPDATE archive_files SET extracted_text=?, detected_invoice_number=?,
+        detected_issue_date=?, detected_amount_cents=?, detected_customer_name=?,
+        detected_customer_number=?, detected_street=?, detected_postal_code=?, detected_city=?, analyzed_at=?,
+        analysis_error=? WHERE id=?
+        """,
+        (
+            result["text"], result["invoice_number"], result["issue_date"],
+            result["amount_cents"], result["customer_name"], result["customer_number"],
+            result["street"], result["postal_code"],
+            result["city"], Database.now(), result["error"],
+            archive_id,
+        ),
+    )
+
+
+def settings_page(settings: dict[str, str]) -> str:
+    fields = [
+        ("company_name", "Unternehmensname"), ("owner_name", "Inhaber"), ("street", "Straße"),
+        ("postal_code", "PLZ"), ("city", "Ort"), ("country", "Land"),
+        ("phone", "Telefon"), ("email", "E-Mail"),
+        ("website", "Website"), ("tax_number", "Steuernummer"), ("iban", "IBAN"), ("bic", "BIC"),
+        ("bank_name", "Bank"), ("payment_terms_days", "Zahlungsziel in Tagen"),
+        ("graph_tenant_id", "Microsoft Tenant-ID"), ("graph_client_id", "Microsoft Client-ID"),
+        ("graph_sender", "Graph-Absender"),
+    ]
+    inputs = "".join(
+        f'<label><span>{h(label)}</span><input name="{h(key)}" value="{h(settings.get(key, ""))}"></label>'
+        for key, label in fields
+    )
+    graph_status = GraphClient(settings).configured()
+    logo_data_uri = company_logo_data_uri()
+    logo_preview = (
+        f'<img class="setup-logo-preview" src="{logo_data_uri}" alt="Aktuelles Logo">'
+        if logo_data_uri else
+        '<div class="setup-logo-empty">Noch kein Logo hinterlegt</div>'
+    )
+    checked = "checked" if settings.get("small_business_enabled", "1") == "1" else ""
+    return f"""
+    <form class="card form" method="post" action="/settings" enctype="multipart/form-data">
+      <div class="settings-status"><span class="status {'paid' if graph_status else 'draft'}">
+      Microsoft Graph: {'eingerichtet' if graph_status else 'noch nicht vollständig'}</span></div>
+      <div class="form-grid">
+      <label class="wide"><span>Unternehmenslogo</span>{logo_preview}
+      <input type="file" name="logo" accept="image/png,image/jpeg,image/webp"></label>
+      {inputs}
+      <label class="check wide"><input type="checkbox" name="small_business_enabled" {checked}>
+      <span>Kleinunternehmerregelung nach § 19 UStG verwenden</span></label>
+      <label class="wide"><span>Kleinunternehmer-Hinweis</span>
+      <input name="small_business_notice" value="{h(settings.get('small_business_notice'))}"></label></div>
+      <div class="form-actions"><button class="button primary">Einstellungen speichern</button></div>
+    </form>"""
+
+
+class ThreadingWSGIServer(ThreadingMixIn, WSGIServer):
+    daemon_threads = True
+
+
+def application(environ, start_response):
+    path = environ.get("PATH_INFO", "/")
+    method = environ.get("REQUEST_METHOD", "GET").upper()
+    query = urllib.parse.parse_qs(environ.get("QUERY_STRING", ""))
+    flash, flash_headers = get_flash(environ)
+
+    if path.startswith("/static/"):
+        target = (APP_ROOT / path.lstrip("/")).resolve()
+        static_root = (APP_ROOT / "static").resolve()
+        if static_root not in target.parents or not target.is_file():
+            return response(start_response, "Nicht gefunden", 404)
+        return response(
+            start_response,
+            target.read_bytes(),
+            content_type=mimetypes.guess_type(target.name)[0] or "application/octet-stream",
+        )
+    if method == "GET" and path == "/health":
+        return response(start_response, '{"status":"ok"}', content_type="application/json")
+
+    try:
+        with DB.connect() as connection:
+            current_settings = {
+                row["key"]: row["value"]
+                for row in connection.execute("SELECT key, value FROM settings")
+            }
+            if current_settings.get("setup_complete") != "1":
+                if method == "GET" and path == "/setup":
+                    return response(start_response, setup_page(current_settings))
+                if method == "POST" and path == "/setup":
+                    form = parse_form(environ)
+                    required = {
+                        "company_name": "Unternehmensname",
+                        "owner_name": "Inhaber / Geschäftsführung",
+                        "street": "Straße und Hausnummer",
+                        "postal_code": "PLZ",
+                        "city": "Ort",
+                        "email": "E-Mail",
+                        "payment_terms_days": "Zahlungsziel",
+                    }
+                    missing = [
+                        label for key, label in required.items()
+                        if not str(form.get(key, "")).strip()
+                    ]
+                    if missing:
+                        raise ValueError(
+                            "Bitte folgende Pflichtfelder ausfüllen: " + ", ".join(missing)
+                        )
+                    try:
+                        terms = int(str(form["payment_terms_days"]).strip())
+                    except ValueError as exc:
+                        raise ValueError("Das Zahlungsziel muss eine ganze Zahl sein.") from exc
+                    if not 0 <= terms <= 365:
+                        raise ValueError("Das Zahlungsziel muss zwischen 0 und 365 Tagen liegen.")
+                    save_company_logo(form.get("logo"))
+                    setup_keys = {
+                        "company_name", "owner_name", "street", "postal_code", "city",
+                        "country", "phone", "email", "website", "tax_number", "iban", "bic",
+                        "bank_name", "small_business_notice", "graph_tenant_id",
+                        "graph_client_id", "graph_sender",
+                    }
+                    values = {
+                        key: str(form.get(key, "")).strip()
+                        for key in setup_keys
+                    }
+                    values.update({
+                        "setup_complete": "1",
+                        "small_business_enabled":
+                            "1" if form.get("small_business_enabled") == "on" else "0",
+                        "payment_terms_days": str(terms),
+                        "invoice_counter": normalized_counter(form.get("invoice_counter", "0")),
+                        "customer_counter": normalized_counter(form.get("customer_counter", "0")),
+                        "offer_counter": normalized_counter(form.get("offer_counter", "0")),
+                        "order_counter": normalized_counter(form.get("order_counter", "0")),
+                    })
+                    if not values["graph_sender"]:
+                        values["graph_sender"] = values["email"]
+                    connection.executemany(
+                        """
+                        INSERT INTO settings(key, value) VALUES (?, ?)
+                        ON CONFLICT(key) DO UPDATE SET value=excluded.value
+                        """,
+                        values.items(),
+                    )
+                    Database.audit(
+                        connection, "settings", None, "setup_completed",
+                        ", ".join(sorted(values)),
+                    )
+                    return redirect(
+                        start_response, "/",
+                        f"{values['company_name']} Buchhaltung wurde eingerichtet.",
+                    )
+                return redirect(start_response, "/setup")
+            if path == "/setup":
+                return redirect(start_response, "/")
+            if method == "GET" and path == "/":
+                body, title, active = dashboard(connection), "Übersicht", "dashboard"
+            elif method == "GET" and path == "/customers":
+                body, title, active = customers_page(connection), "Kunden", "customers"
+            elif method == "GET" and path == "/customer/new":
+                body, title, active = customer_form(), "Neuer Kunde", "customers"
+            elif method == "POST" and path == "/customer/new":
+                form = parse_form(environ)
+                settings = DB.settings()
+                number = int(settings["customer_counter"]) + 1
+                now = Database.now()
+                cursor = connection.execute(
+                    """
+                    INSERT INTO customers(customer_number, company, contact_name, street, postal_code, city, email, buyer_reference, notes, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (str(number), form["company"], form.get("contact_name", ""), form["street"],
+                     form["postal_code"], form["city"], form.get("email", ""),
+                     form.get("buyer_reference", ""), form.get("notes", ""), now, now),
+                )
+                connection.execute("UPDATE settings SET value=? WHERE key='customer_counter'", (str(number),))
+                Database.audit(connection, "customer", cursor.lastrowid, "created", str(number))
+                return redirect(start_response, "/customers", f"Kunde {form['company']} wurde angelegt.")
+            elif method == "GET" and re.fullmatch(r"/customer/\d+", path):
+                customer_id = int(path.split("/")[2])
+                customer = connection.execute("SELECT company FROM customers WHERE id=?", (customer_id,)).fetchone()
+                body, title, active = customer_detail(connection, customer_id), customer["company"], "customers"
+            elif method == "GET" and re.fullmatch(r"/customer/\d+/edit", path):
+                customer_id = int(path.split("/")[2])
+                customer = connection.execute("SELECT * FROM customers WHERE id=?", (customer_id,)).fetchone()
+                if not customer:
+                    raise ValueError("Kunde wurde nicht gefunden.")
+                body, title, active = customer_form(customer), "Kunde bearbeiten", "customers"
+            elif method == "POST" and re.fullmatch(r"/customer/\d+/edit", path):
+                customer_id = int(path.split("/")[2])
+                form = parse_form(environ)
+                now = Database.now()
+                connection.execute(
+                    """
+                    UPDATE customers SET company=?, contact_name=?, street=?, postal_code=?, city=?,
+                    country=?, email=?, buyer_reference=?, notes=?, updated_at=? WHERE id=?
+                    """,
+                    (
+                        form["company"].strip(), form.get("contact_name", "").strip(),
+                        form["street"].strip(), form["postal_code"].strip(), form["city"].strip(),
+                        form.get("country", "Deutschland").strip(), form.get("email", "").strip(),
+                        form.get("buyer_reference", "").strip(), form.get("notes", "").strip(),
+                        now, customer_id,
+                    ),
+                )
+                Database.audit(connection, "customer", customer_id, "updated")
+                return redirect(start_response, f"/customer/{customer_id}", "Kundendaten wurden gespeichert.")
+            elif method == "GET" and re.fullmatch(r"/customer/\d+/recurring/new", path):
+                customer_id = int(path.split("/")[2])
+                body, title, active = recurring_form(connection, customer_id), "Dauerrechnung anlegen", "customers"
+            elif method == "POST" and re.fullmatch(r"/customer/\d+/recurring/new", path):
+                customer_id = int(path.split("/")[2])
+                form = parse_form(environ)
+                customer = connection.execute("SELECT email FROM customers WHERE id=?", (customer_id,)).fetchone()
+                auto_send = 1 if form.get("auto_send") == "on" else 0
+                if auto_send and (not customer or not customer["email"]):
+                    raise ValueError("Für automatischen Versand fehlt die Rechnungs-E-Mail.")
+                now = Database.now()
+                recurring_id = connection.execute(
+                    """
+                    INSERT INTO recurring_invoices(customer_id, active, title, category, description,
+                    service_period_template, quantity_milli, unit, unit_price_cents, billing_day,
+                    auto_finalize, auto_send, created_at, updated_at)
+                    VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        customer_id, form.get("title", "").strip(), form.get("category", "").strip(),
+                        form["description"].strip(), form.get("service_period_template", "{monat} {jahr}").strip(),
+                        quantity_milli(form.get("quantity", "1")), form.get("unit", "pauschal").strip(),
+                        cents(form["unit_price"]), int(form["billing_day"]),
+                        1 if form.get("auto_finalize") == "on" or auto_send else 0, auto_send, now, now,
+                    ),
+                ).lastrowid
+                Database.audit(connection, "recurring_invoice", recurring_id, "created")
+                return redirect(start_response, f"/customer/{customer_id}", "Monatliche Rechnung wurde eingerichtet.")
+            elif method == "POST" and re.fullmatch(r"/recurring/\d+/toggle", path):
+                recurring_id = int(path.split("/")[2])
+                template = connection.execute(
+                    "SELECT customer_id, active FROM recurring_invoices WHERE id=?", (recurring_id,)
+                ).fetchone()
+                if not template:
+                    raise ValueError("Dauerrechnung wurde nicht gefunden.")
+                connection.execute(
+                    "UPDATE recurring_invoices SET active=?, updated_at=? WHERE id=?",
+                    (0 if template["active"] else 1, Database.now(), recurring_id),
+                )
+                return redirect(start_response, f"/customer/{template['customer_id']}", "Status wurde geändert.")
+            elif method == "POST" and re.fullmatch(r"/recurring/\d+/run", path):
+                recurring_id = int(path.split("/")[2])
+                template = connection.execute(
+                    "SELECT customer_id FROM recurring_invoices WHERE id=?", (recurring_id,)
+                ).fetchone()
+                if not template:
+                    raise ValueError("Dauerrechnung wurde nicht gefunden.")
+                result = run_recurring_invoice(connection, recurring_id, date.today(), manual=True)
+                if not result:
+                    return redirect(
+                        start_response, f"/customer/{template['customer_id']}",
+                        "Für diesen Monat wurde bereits eine Rechnung erzeugt.", "error",
+                    )
+                document_id, status, error = result
+                message = f"Monatsrechnung wurde erzeugt ({status})."
+                if error:
+                    message += f" Versandfehler: {error}"
+                return redirect(
+                    start_response, f"/document/{document_id}", message,
+                    "error" if error else "success",
+                )
+            elif method == "GET" and path == "/documents":
+                doc_type = query.get("type", ["invoice"])[0]
+                body, title, active = documents_page(connection, doc_type), TYPE_LABELS.get(doc_type, "Rechnungen"), doc_type
+            elif method == "GET" and path == "/document/new":
+                doc_type = query.get("type", ["invoice"])[0]
+                source_id = int(query["source"][0]) if query.get("source") else None
+                customer_id = int(query["customer"][0]) if query.get("customer") else None
+                body, title, active = document_form(
+                    connection, doc_type, source_id, customer_id
+                ), f"Neue {TYPE_LABELS.get(doc_type, 'Rechnung')}", doc_type
+            elif method == "POST" and path == "/document/new":
+                form = parse_form(environ)
+                doc_type = form.get("document_type", "invoice")
+                issue_date = form["issue_date"]
+                settings = DB.settings()
+                terms = int(settings["payment_terms_days"])
+                due_date = (date.fromisoformat(issue_date) + timedelta(days=terms)).isoformat() if doc_type == "invoice" else None
+                qty = quantity_milli(form.get("quantity", "1"))
+                unit_price = cents(form["unit_price"])
+                total = int((Decimal(qty) / 1000 * unit_price).quantize(Decimal("1")))
+                now = Database.now()
+                cursor = connection.execute(
+                    """
+                    INSERT INTO documents(document_type, status, customer_id, issue_date, service_start, service_end,
+                    due_date, payment_terms_days, title, notes, source_document_id, total_cents, created_at, updated_at)
+                    VALUES (?, 'draft', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (doc_type, int(form["customer_id"]), issue_date, form.get("service_start") or None,
+                     form.get("service_end") or None, due_date, terms, form.get("title", ""),
+                     form.get("notes", ""), int(form["source_document_id"]) if form.get("source_document_id") else None,
+                     total, now, now),
+                )
+                document_id = cursor.lastrowid
+                connection.execute(
+                    """
+                    INSERT INTO document_items(document_id, position, category, description, quantity_milli, unit,
+                    unit_price_cents, total_cents, service_period) VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (document_id, form.get("category", ""), form["description"], qty, form.get("unit", "pauschal"),
+                     unit_price, total, form.get("service_period", "")),
+                )
+                Database.audit(connection, "document", document_id, "created", doc_type)
+                return redirect(start_response, f"/document/{document_id}", "Entwurf wurde gespeichert.")
+            elif method == "GET" and re.fullmatch(r"/document/\d+", path):
+                document_id = int(path.rsplit("/", 1)[1])
+                document = fetch_document(connection, document_id)
+                body, title, active = document_detail(connection, document_id), document["document_number"] or "Entwurf", document["document_type"]
+            elif method == "POST" and re.fullmatch(r"/document/\d+/finalize", path):
+                document_id = int(path.split("/")[2])
+                number = finalize_document(connection, document_id)
+                return redirect(start_response, f"/document/{document_id}", f"{number} wurde fertiggestellt.")
+            elif method == "GET" and re.fullmatch(r"/document/\d+/pdf", path):
+                document_id = int(path.split("/")[2])
+                document = fetch_document(connection, document_id)
+                pdf = generate_pdf(connection, document_id)
+                return response(
+                    start_response, pdf.read_bytes(), content_type="application/pdf",
+                    headers=[("Content-Disposition", f'inline; filename="{document["document_number"]}.pdf"')],
+                )
+            elif method == "POST" and re.fullmatch(r"/document/\d+/paid", path):
+                document_id = int(path.split("/")[2])
+                now = Database.now()
+                connection.execute("UPDATE documents SET status='paid', paid_at=?, updated_at=? WHERE id=?", (now, now, document_id))
+                Database.audit(connection, "document", document_id, "paid")
+                return redirect(start_response, f"/document/{document_id}", "Zahlung wurde verbucht.")
+            elif method == "POST" and re.fullmatch(r"/document/\d+/convert", path):
+                source_id = int(path.split("/")[2])
+                target = query.get("to", [""])[0]
+                if target not in ("order", "invoice"):
+                    raise ValueError("Ungültiger Dokumenttyp.")
+                return redirect(start_response, f"/document/new?type={target}&source={source_id}")
+            elif method == "POST" and re.fullmatch(r"/document/\d+/send", path):
+                document_id = int(path.split("/")[2])
+                send_document_email(connection, document_id)
+                return redirect(start_response, f"/document/{document_id}", "E-Mail wurde über Microsoft Graph versendet.")
+            elif method == "GET" and path == "/archive":
+                body, title, active = archive_page(connection), "Dokumentenarchiv", "archive"
+            elif method == "GET" and re.fullmatch(r"/archive/\d+", path):
+                archive_id = int(path.split("/")[2])
+                body, title, active = archive_detail(connection, archive_id), "PDF-Import prüfen", "archive"
+            elif method == "GET" and re.fullmatch(r"/archive/\d+/pdf", path):
+                archive_id = int(path.split("/")[2])
+                item = connection.execute(
+                    "SELECT original_filename, stored_filename FROM archive_files WHERE id=?",
+                    (archive_id,),
+                ).fetchone()
+                if not item:
+                    raise ValueError("Archivdatei wurde nicht gefunden.")
+                archive_root = (DATA_DIR / "archive").resolve()
+                target = (archive_root / item["stored_filename"]).resolve()
+                if target.parent != archive_root or not target.is_file():
+                    raise ValueError("Die archivierte Originaldatei wurde nicht gefunden.")
+                display_name = re.sub(r"[^A-Za-z0-9._-]", "_", item["original_filename"])
+                return response(
+                    start_response, target.read_bytes(), content_type="application/pdf",
+                    headers=[("Content-Disposition", f'inline; filename="{display_name}"')],
+                )
+            elif method == "POST" and path == "/archive/upload":
+                form = parse_form(environ)
+                upload = form.get("pdf")
+                if not upload or not isinstance(upload, UploadedFile):
+                    raise ValueError("Bitte eine PDF-Datei auswählen.")
+                raw = upload.data
+                if not raw.startswith(b"%PDF-"):
+                    raise ValueError("Die ausgewählte Datei ist keine gültige PDF-Datei.")
+                digest = hashlib.sha256(raw).hexdigest()
+                safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", Path(upload.filename).name)
+                stored_name = f"{datetime.now():%Y%m%d%H%M%S}-{digest[:12]}-{safe_name}"
+                target = DATA_DIR / "archive" / stored_name
+                existing = connection.execute(
+                    "SELECT id FROM archive_files WHERE sha256=? ORDER BY id LIMIT 1", (digest,)
+                ).fetchone()
+                if existing:
+                    return redirect(
+                        start_response, f"/archive/{existing['id']}",
+                        "Diese PDF-Datei ist bereits im Archiv.", "error",
+                    )
+                target.write_bytes(raw)
+                cursor = connection.execute(
+                    """
+                    INSERT INTO archive_files(original_filename, stored_filename, sha256, mime_type, file_size, uploaded_at)
+                    VALUES (?, ?, ?, 'application/pdf', ?, ?)
+                    """,
+                    (Path(upload.filename).name, stored_name, digest, len(raw), Database.now()),
+                )
+                archive_id = cursor.lastrowid
+                result = analyze_invoice_pdf(raw, upload.filename, DB.settings())
+                if form.get("document_number"):
+                    result["invoice_number"] = form["document_number"].strip()
+                if form.get("issue_date"):
+                    result["issue_date"] = form["issue_date"]
+                if form.get("amount"):
+                    result["amount_cents"] = cents(form["amount"])
+                update_archive_analysis(connection, archive_id, result)
+                Database.audit(connection, "archive", archive_id, "uploaded_and_analyzed", upload.filename)
+                return redirect(start_response, f"/archive/{archive_id}", "PDF wurde archiviert und analysiert.")
+            elif method == "POST" and re.fullmatch(r"/archive/\d+/analyze", path):
+                archive_id = int(path.split("/")[2])
+                item = connection.execute(
+                    "SELECT original_filename, stored_filename FROM archive_files WHERE id=?",
+                    (archive_id,),
+                ).fetchone()
+                if not item:
+                    raise ValueError("Archivdatei wurde nicht gefunden.")
+                target = DATA_DIR / "archive" / item["stored_filename"]
+                result = analyze_invoice_pdf(
+                    target.read_bytes(), item["original_filename"], DB.settings()
+                )
+                update_archive_analysis(connection, archive_id, result)
+                Database.audit(connection, "archive", archive_id, "reanalyzed")
+                message = "PDF wurde erneut analysiert." if not result["error"] else result["error"]
+                return redirect(
+                    start_response, f"/archive/{archive_id}", message,
+                    "error" if result["error"] else "success",
+                )
+            elif method == "POST" and re.fullmatch(r"/archive/\d+/metadata", path):
+                archive_id = int(path.split("/")[2])
+                form = parse_form(environ)
+                connection.execute(
+                    """
+                    UPDATE archive_files SET detected_invoice_number=?, detected_issue_date=?,
+                    detected_amount_cents=?, detected_customer_name=?, detected_street=?,
+                    detected_postal_code=?, detected_city=?, detected_customer_number=? WHERE id=?
+                    """,
+                    (
+                        form.get("invoice_number", "").strip(), form.get("issue_date", ""),
+                        cents(form["amount"]) if form.get("amount") else None,
+                        form.get("customer_name", "").strip(), form.get("street", "").strip(),
+                        form.get("postal_code", "").strip(), form.get("city", "").strip(),
+                        form.get("customer_number", "").strip(),
+                        archive_id,
+                    ),
+                )
+                Database.audit(connection, "archive", archive_id, "metadata_corrected")
+                return redirect(start_response, f"/archive/{archive_id}", "Korrekturen wurden gespeichert.")
+            elif method == "POST" and re.fullmatch(r"/archive/\d+/customer", path):
+                archive_id = int(path.split("/")[2])
+                item = connection.execute(
+                    "SELECT * FROM archive_files WHERE id=?", (archive_id,)
+                ).fetchone()
+                if not item or not item["detected_customer_name"]:
+                    raise ValueError("Bitte zuerst mindestens den Kundennamen prüfen und speichern.")
+                existing_customer = connection.execute(
+                    """
+                    SELECT id, customer_number FROM customers
+                    WHERE (
+                        ? != '' AND customer_number=?
+                    ) OR (
+                        lower(trim(company))=lower(trim(?))
+                        AND (?='' OR postal_code=?)
+                    )
+                    ORDER BY id LIMIT 1
+                    """,
+                    (
+                        item["detected_customer_number"], item["detected_customer_number"],
+                        item["detected_customer_name"], item["detected_postal_code"],
+                        item["detected_postal_code"],
+                    ),
+                ).fetchone()
+                if existing_customer:
+                    customer_id = existing_customer["id"]
+                    customer_number = existing_customer["customer_number"]
+                    message = f"Vorhandener Kunde {customer_number} wurde mit dem PDF verknüpft."
+                else:
+                    settings = DB.settings()
+                    detected_number = item["detected_customer_number"].strip()
+                    number_in_use = (
+                        connection.execute(
+                            "SELECT 1 FROM customers WHERE customer_number=?",
+                            (detected_number,),
+                        ).fetchone()
+                        if detected_number else None
+                    )
+                    customer_number = (
+                        detected_number
+                        if detected_number and not number_in_use
+                        else str(int(settings["customer_counter"]) + 1)
+                    )
+                    now = Database.now()
+                    customer_id = connection.execute(
+                        """
+                        INSERT INTO customers(customer_number, company, street, postal_code, city, created_at, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            customer_number, item["detected_customer_name"],
+                            item["detected_street"], item["detected_postal_code"],
+                            item["detected_city"], now, now,
+                        ),
+                    ).lastrowid
+                    connection.execute(
+                        "UPDATE settings SET value=? WHERE key='customer_counter'",
+                        (str(max(int(settings["customer_counter"]), int(customer_number)))
+                         if customer_number.isdigit() else settings["customer_counter"],),
+                    )
+                    Database.audit(connection, "customer", customer_id, "created_from_archive", str(archive_id))
+                    message = f"Kunde {customer_number} wurde aus dem PDF angelegt."
+                connection.execute(
+                    "UPDATE archive_files SET customer_id=? WHERE id=?",
+                    (customer_id, archive_id),
+                )
+                Database.audit(connection, "archive", archive_id, "customer_linked", str(customer_id))
+                return redirect(start_response, f"/archive/{archive_id}", message)
+            elif method == "GET" and path == "/settings":
+                body, title, active = settings_page(DB.settings()), "Einstellungen", "settings"
+            elif method == "POST" and path == "/settings":
+                form = parse_form(environ)
+                save_company_logo(form.get("logo"))
+                allowed = set(DB.settings()) - {
+                    "setup_complete", "invoice_counter", "customer_counter",
+                    "offer_counter", "order_counter",
+                    "graph_certificate_path", "graph_private_key_path",
+                }
+                values = {
+                    key: str(value).strip()
+                    for key, value in form.items()
+                    if key in allowed and not isinstance(value, UploadedFile)
+                }
+                values["small_business_enabled"] = (
+                    "1" if form.get("small_business_enabled") == "on" else "0"
+                )
+                if "payment_terms_days" in values:
+                    try:
+                        terms = int(values["payment_terms_days"])
+                    except ValueError as exc:
+                        raise ValueError("Das Zahlungsziel muss eine ganze Zahl sein.") from exc
+                    if not 0 <= terms <= 365:
+                        raise ValueError("Das Zahlungsziel muss zwischen 0 und 365 Tagen liegen.")
+                DB.update_settings(values)
+                return redirect(start_response, "/settings", "Einstellungen wurden gespeichert.")
+            else:
+                return response(start_response, layout("Nicht gefunden", "<div class='alert error'>Seite nicht gefunden.</div>"), 404)
+    except (ValueError, sqlite3.Error, RuntimeError) as exc:
+        return response(
+            start_response,
+            layout("Fehler", f'<div class="alert error">{h(exc)}</div><a class="button" href="/">Zur Übersicht</a>'),
+            400,
+        )
+    return response(start_response, layout(title, flash + body, active), headers=flash_headers)
+
+
+if __name__ == "__main__":
+    port = int(os.environ.get("HD_PORT", "8099"))
+    host = os.environ.get("HD_HOST", "0.0.0.0")
+    threading.Thread(target=recurring_worker, daemon=True, name="recurring-invoices").start()
+    print(f"Buchhaltung läuft auf http://{host}:{port}", flush=True)
+    with make_server(host, port, application, server_class=ThreadingWSGIServer, handler_class=WSGIRequestHandler) as server:
+        server.serve_forever()
