@@ -123,7 +123,7 @@ CREATE TABLE IF NOT EXISTS incoming_invoices (
     status TEXT NOT NULL DEFAULT 'draft'
         CHECK(status IN ('draft','booked','paid','cancelled')),
     description TEXT NOT NULL DEFAULT '',
-    eur_category TEXT NOT NULL DEFAULT 'Sonstige Betriebsausgaben',
+    eur_category TEXT NOT NULL DEFAULT 'Fremdleistungen',
     gross_cents INTEGER NOT NULL DEFAULT 0,
     business_share_percent INTEGER NOT NULL DEFAULT 100
         CHECK(business_share_percent BETWEEN 0 AND 100),

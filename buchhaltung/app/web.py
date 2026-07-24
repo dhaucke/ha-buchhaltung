@@ -2920,13 +2920,14 @@ def application(environ, start_response):
                 incoming_id = connection.execute(
                     """
                     INSERT INTO incoming_invoices(
-                        archive_file_id, invoice_number, invoice_date, gross_cents,
-                        deductible_cents, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                        archive_file_id, invoice_number, invoice_date, eur_category,
+                        gross_cents, deductible_cents, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         archive_id, item["detected_invoice_number"],
                         item["detected_issue_date"] or date.today().isoformat(),
+                        "Fremdleistungen",
                         item["detected_amount_cents"] or 0,
                         item["detected_amount_cents"] or 0,
                         now, now,
@@ -3015,7 +3016,7 @@ def application(environ, start_response):
                         supplier_id, str(form.get("invoice_number", "")).strip(),
                         str(form.get("invoice_date", "")), str(form.get("due_date", "")) or None,
                         payment_date, action, str(form.get("description", "")).strip(),
-                        str(form.get("eur_category", "Sonstige Betriebsausgaben")),
+                        str(form.get("eur_category", "Fremdleistungen")),
                         gross_cents, share, deductible, str(form.get("notes", "")).strip(),
                         now, now, incoming_id,
                     ),

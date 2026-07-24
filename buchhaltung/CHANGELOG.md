@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.5.10
+
+- Standard-EÜR-Kategorie für neu erfasste Eingangsrechnungen ist jetzt
+  „Fremdleistungen“ statt „Sonstige Betriebsausgaben“
+
 ## 0.5.9
 
 - Lieferanten können ein eigenes Zahlungsziel in Tagen hinterlegen
