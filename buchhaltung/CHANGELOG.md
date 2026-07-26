@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.9.0
+
+- Reverse-Charge-Verfahren (§ 13b UStG) für ausländische EU-Firmenkunden:
+  Kunden erhalten ein Feld für die USt-IdNr.; ist diese gesetzt und der
+  Kunde nicht in Deutschland ansässig, wird bei aktiver Regelbesteuerung
+  automatisch ohne deutsche Umsatzsteuer fakturiert (Hinweistext auf
+  Rechnung/Gutschrift, korrekte ZUGFeRD-Kennzeichnung inkl. Käufer-USt-IdNr.)
+  – unabhängig vom je Position gewählten USt-Satz
+- Fehler behoben: beim Neuanlegen eines Kunden wurde das Land nie
+  gespeichert (nur beim Bearbeiten), sodass neue Kunden immer als
+  „Deutschland“ geführt wurden
+- neue Auswertung „USt-Zahllast“ (nur bei aktiver Regelbesteuerung
+  sichtbar): vereinnahmte USt abzüglich gezahlter Vorsteuer je Monat
+  oder Quartal, mit Hinweis auf die gesetzliche Meldefrist – eine
+  Vorschau auf Zahlungsdatenbasis, keine Umsatzsteuervoranmeldung
+- Länder-Erkennung für ZUGFeRD (u. a. für Steuernummer/Ländercode)
+  kennt jetzt gängige EU-Länder auch in deutscher Schreibweise
+  (Niederlande, Belgien, Frankreich, Italien, Spanien, Polen,
+  Tschechien, Dänemark, Luxemburg)
+
 ## 0.8.1
 
 - Fehler behoben: automatisch erzeugte Dauerrechnungen haben bei aktiver

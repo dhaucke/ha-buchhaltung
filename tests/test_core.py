@@ -18,7 +18,9 @@ sys.path.insert(0, str(APP_DIR))
 
 from db import Database, suggested_payment_date
 from einvoice import create_zugferd, validate_schematron
-from euer import create_euer_csv, create_euer_pdf, euer_entries, euer_summary
+from euer import (
+    create_euer_csv, create_euer_pdf, euer_entries, euer_summary, vat_liability_by_period,
+)
 from pdfgen import create_document_pdf
 from pdfimport import analyze_invoice_pdf
 
@@ -923,6 +925,157 @@ class CoreTests(unittest.TestCase):
 
         self.assertEqual(incoming_result["tax_rate_bp"], 1900)
         self.assertIsNone(outgoing_result["tax_rate_bp"])
+
+    def test_customer_reverse_charge_applies_requires_regelbesteuerung_foreign_and_vat_id(self):
+        os.environ.setdefault("HD_DATA_DIR", tempfile.mkdtemp())
+        from web import customer_reverse_charge_applies
+
+        foreign_with_vat_id = {"country": "Niederlande", "vat_id": "NL123456789B01"}
+        regelbesteuerung = {"small_business_enabled": "0"}
+        kleinunternehmer = {"small_business_enabled": "1"}
+
+        self.assertTrue(
+            customer_reverse_charge_applies(foreign_with_vat_id, regelbesteuerung)
+        )
+        self.assertFalse(
+            customer_reverse_charge_applies(foreign_with_vat_id, kleinunternehmer)
+        )
+        self.assertFalse(
+            customer_reverse_charge_applies(
+                {"country": "Deutschland", "vat_id": "DE123456789"}, regelbesteuerung
+            )
+        )
+        self.assertFalse(
+            customer_reverse_charge_applies(
+                {"country": "Niederlande", "vat_id": ""}, regelbesteuerung
+            )
+        )
+
+    def test_document_totals_forces_zero_tax_for_reverse_charge(self):
+        os.environ.setdefault("HD_DATA_DIR", tempfile.mkdtemp())
+        from web import document_totals
+
+        items = [{"total_cents": 10000, "tax_rate_bp": 1900}]
+        settings = {"small_business_enabled": "0"}
+        net, tax, gross = document_totals(items, settings, reverse_charge=True)
+        self.assertEqual((net, tax, gross), (10000, 0, 10000))
+        net, tax, gross = document_totals(items, settings, reverse_charge=False)
+        self.assertEqual((net, tax, gross), (10000, 1900, 11900))
+
+    def test_reverse_charge_pdf_shows_notice_without_vat_breakdown(self):
+        settings = {
+            "company_name": "Musterbetrieb", "owner_name": "Max Mustermann",
+            "street": "Beispielstraße 1", "postal_code": "10117", "city": "Berlin",
+            "email": "rechnung@example.invalid", "small_business_enabled": "0",
+        }
+        output = Path(self.temp.name) / "reverse-charge.pdf"
+        create_document_pdf(
+            output,
+            {
+                "document_type": "invoice", "document_number": "2026-07-0200",
+                "issue_date": "2026-07-23", "due_date": "2026-08-06",
+                "title": "Consulting", "introduction": "", "notes": "",
+                "total_cents": 10000, "tax_cents": 0, "reverse_charge": True,
+            },
+            {
+                "customer_number": "2001", "company": "Foreign BV", "contact_name": "",
+                "street": "Keizersgracht 1", "postal_code": "1015CJ", "city": "Amsterdam",
+            },
+            [{
+                "position": 1, "category": "Beratung", "description": "Consulting",
+                "quantity_milli": 1000, "unit": "pauschal", "unit_price_cents": 10000,
+                "total_cents": 10000, "tax_rate_bp": 1900, "service_period": "",
+            }],
+            settings, None,
+        )
+        with pdfplumber.open(output) as pdf:
+            text = "\n".join(page.extract_text() or "" for page in pdf.pages)
+        self.assertIn("Steuerschuldnerschaft des Leistungsempfängers", text)
+        self.assertIn("§ 13b UStG", text)
+        self.assertNotIn("Nettobetrag", text)
+        self.assertNotIn("zzgl.", text)
+        self.assertIn("Rechnungsbetrag", text)
+        self.assertIn("100,00 €", text)
+
+    def test_zugferd_reverse_charge_uses_ae_category_and_buyer_vat_id(self):
+        try:
+            from facturx import get_xml_from_pdf, xml_check_xsd
+        except ImportError:
+            self.skipTest("factur-x ist in der lokalen Testumgebung nicht installiert")
+        settings = self.db.settings()
+        settings.update({
+            "company_name": "Musterbetrieb", "owner_name": "Max Mustermann",
+            "street": "Beispielstraße 1", "postal_code": "10117", "city": "Berlin",
+            "country": "Deutschland", "email": "rechnung@example.invalid",
+            "tax_number": "12/345/67890", "vat_id": "DE123456789",
+            "iban": "DE02120300000000202051", "small_business_enabled": "0",
+        })
+        document = {
+            "document_type": "invoice", "document_number": "2026-07-0201",
+            "issue_date": "2026-07-23", "due_date": "2026-08-06",
+            "service_start": None, "service_end": None, "payment_terms_days": 14,
+            "title": "Consulting", "introduction": "", "notes": "",
+            "credit_reason": "", "total_cents": 10000, "tax_cents": 0,
+            "reverse_charge": True,
+        }
+        customer = {
+            "customer_number": "2001", "company": "Foreign BV", "contact_name": "",
+            "street": "Keizersgracht 1", "postal_code": "1015CJ", "city": "Amsterdam",
+            "country": "Niederlande", "email": "kunde@example.invalid",
+            "buyer_reference": "", "vat_id": "NL123456789B01",
+        }
+        items = [{
+            "position": 1, "category": "Beratung", "description": "Consulting",
+            "quantity_milli": 1000, "unit": "pauschal", "unit_price_cents": 10000,
+            "total_cents": 10000, "tax_rate_bp": 1900, "service_period": "",
+        }]
+        regular = Path(self.temp.name) / "reverse-charge.pdf"
+        output = Path(self.temp.name) / "reverse-charge-zugferd.pdf"
+        xml_output = Path(self.temp.name) / "factur-x-reverse-charge.xml"
+        create_document_pdf(regular, document, customer, items, settings, None)
+        result = create_zugferd(
+            regular, output, xml_output, document, customer, items, settings
+        )
+        embedded_name, embedded_xml = get_xml_from_pdf(
+            output.read_bytes(), check_xsd=True, check_schematron=False
+        )
+        self.assertEqual(embedded_name, "factur-x.xml")
+        self.assertTrue(xml_check_xsd(embedded_xml, flavor="factur-x", level="en16931"))
+        self.assertTrue(result["xsd_valid"])
+        self.assertIn(b"NL123456789B01", xml_output.read_bytes())
+        schematron = validate_schematron(xml_output.read_bytes())
+        if schematron["available"]:
+            self.assertTrue(result["schematron_checked"])
+            self.assertTrue(
+                result["schematron_valid"],
+                f"Mustang-Schematron-Prüfung meldet EN-16931-Regelverstöße:\n{schematron['report']}",
+            )
+        else:
+            self.assertFalse(result["schematron_checked"])
+            self.assertIsNone(result["schematron_valid"])
+
+    def test_vat_liability_by_period_groups_month_and_quarter(self):
+        entries = [
+            {"kind": "Einnahme", "date": "2026-01-10", "tax_cents": 1900},
+            {"kind": "Einnahme", "date": "2026-02-10", "tax_cents": 3800},
+            {"kind": "Ausgabe", "date": "2026-01-15", "vorsteuer_cents": 190},
+        ]
+        monthly = vat_liability_by_period(entries, "month")
+        self.assertEqual(len(monthly), 2)
+        self.assertEqual(monthly[0]["period_label"], "Januar 2026")
+        self.assertEqual(monthly[0]["tax_collected_cents"], 1900)
+        self.assertEqual(monthly[0]["vorsteuer_paid_cents"], 190)
+        self.assertEqual(monthly[0]["balance_cents"], 1710)
+        self.assertEqual(monthly[0]["due_date"], "2026-02-10")
+        self.assertEqual(monthly[1]["period_label"], "Februar 2026")
+        self.assertEqual(monthly[1]["due_date"], "2026-03-10")
+
+        quarterly = vat_liability_by_period(entries, "quarter")
+        self.assertEqual(len(quarterly), 1)
+        self.assertEqual(quarterly[0]["period_label"], "1. Quartal 2026")
+        self.assertEqual(quarterly[0]["tax_collected_cents"], 5700)
+        self.assertEqual(quarterly[0]["balance_cents"], 5510)
+        self.assertEqual(quarterly[0]["due_date"], "2026-04-10")
 
     def test_zugferd_generation_and_embedded_xml_validation(self):
         try:

@@ -29,7 +29,10 @@ from PIL import Image as PillowImage, UnidentifiedImageError
 from db import DEFAULT_SETTINGS, Database, suggested_payment_date
 from einvoice import create_zugferd
 from graph import GraphClient
-from euer import EXPENSE_CATEGORIES, create_euer_csv, create_euer_pdf, euer_entries, euer_summary
+from euer import (
+    EXPENSE_CATEGORIES, create_euer_csv, create_euer_pdf, euer_entries, euer_summary,
+    vat_liability_by_period,
+)
 from pdfgen import TYPE_LABELS, create_document_pdf, german_date, money
 from pdfimport import analyze_invoice_pdf
 
@@ -184,12 +187,34 @@ def replace_document_items(connection, document_id: int, items: list[dict]) -> N
     )
 
 
-def document_totals(items: list[dict], settings: dict[str, str]) -> tuple[int, int, int]:
-    """Return (net_cents, tax_cents, gross_cents). Kleinunternehmer always nets to zero tax,
-    regardless of any tax_rate_bp submitted, so a stale form or a mode switch mid-edit can
-    never silently add VAT to an exempt invoice."""
-    net_total = sum(item["total_cents"] for item in items)
+REVERSE_CHARGE_NOTICE = (
+    "Steuerschuldnerschaft des Leistungsempfängers (Reverse-Charge-Verfahren gemäß § 13b UStG)."
+)
+GERMANY_NAMES = {"deutschland", "germany", "de"}
+
+
+def is_domestic_country(country: str) -> bool:
+    return (country or "").strip().lower() in GERMANY_NAMES
+
+
+def customer_reverse_charge_applies(customer: dict, settings: dict[str, str]) -> bool:
+    """§13b UStG reverse charge: only relevant for Regelbesteuerung, a foreign customer,
+    and a recorded customer VAT-ID (required for the invoice to be valid under BR-AE-*)."""
     if settings.get("small_business_enabled", "1") == "1":
+        return False
+    if not (customer.get("vat_id") or "").strip():
+        return False
+    return not is_domestic_country(customer.get("country", ""))
+
+
+def document_totals(
+    items: list[dict], settings: dict[str, str], reverse_charge: bool = False
+) -> tuple[int, int, int]:
+    """Return (net_cents, tax_cents, gross_cents). Kleinunternehmer and reverse-charge
+    invoices always net to zero tax, regardless of any tax_rate_bp submitted, so a stale
+    form or a mode switch mid-edit can never silently add VAT where none is owed."""
+    net_total = sum(item["total_cents"] for item in items)
+    if settings.get("small_business_enabled", "1") == "1" or reverse_charge:
         return net_total, 0, net_total
     tax_total = sum(
         int(
@@ -414,6 +439,10 @@ def layout(title: str, body: str, active: str = "") -> str:
         ]),
         ("Auswertung", [
             ("/reports/euer", "reports", "EÜR"),
+            *(
+                [("/reports/zahllast", "zahllast", "USt-Zahllast")]
+                if settings.get("small_business_enabled", "1") != "1" else []
+            ),
         ]),
         (None, [("/settings", "settings", "Einstellungen")]),
     ]
@@ -844,6 +873,9 @@ def customer_form(customer=None, warning: str = "") -> str:
         <label><span>PLZ *</span><input required name="postal_code" value="{h(customer.get('postal_code'))}"></label>
         <label><span>Ort *</span><input required name="city" value="{h(customer.get('city'))}"></label>
         <label><span>Land</span><input name="country" value="{h(customer.get('country', 'Deutschland'))}"></label>
+        <label><span>USt-IdNr</span><input name="vat_id" value="{h(customer.get('vat_id'))}">
+        <small class="muted">Bei ausländischen EU-Firmenkunden mit USt-IdNr. wird unter
+        Regelbesteuerung automatisch das Reverse-Charge-Verfahren angewendet.</small></label>
         <label><span>Rechnungs-E-Mail</span><input type="email" name="email" value="{h(customer.get('email'))}"></label>
         <label><span>Buyer Reference</span><input name="buyer_reference" value="{h(customer.get('buyer_reference'))}"></label>
         <label class="wide"><span>Notizen</span><textarea name="notes">{h(customer.get('notes'))}</textarea></label>
@@ -1187,6 +1219,9 @@ def document_form(
     settings = DB.settings()
     tax_enabled = settings.get("small_business_enabled", "1") != "1"
     default_tax_rate_bp = int(settings.get("default_tax_rate_bp", "1900"))
+    reverse_charge_by_customer = json.dumps({
+        c["id"]: customer_reverse_charge_applies(dict(c), settings) for c in customers
+    } if tax_enabled else {})
     if not source_items:
         source_items = [{
             "category": "", "description": "", "service_period": "",
@@ -1217,12 +1252,14 @@ def document_form(
       <input type="hidden" name="document_type" value="{h(doc_type)}">
       <input type="hidden" name="source_document_id" value="{h(source_id or '')}">
       <div class="form-grid">
-        <label><span>Kunde *</span><select required name="customer_id">{customer_options}</select></label>
+        <label><span>Kunde *</span><select required id="document-customer" name="customer_id">{customer_options}</select></label>
         <label><span>Dokumentdatum *</span><input required type="date" name="issue_date" value="{h(issue_date)}"></label>
         <label class="wide"><span>Betreff</span><input name="title" value="{h(title)}" placeholder="z. B. Hosting Services – Virtuelle Webserver"></label>
         <label><span>Leistungsbeginn</span><input type="date" name="service_start" value="{h(service_start)}"></label>
         <label><span>Leistungsende</span><input type="date" name="service_end" value="{h(service_end)}"></label>
       </div>
+      <div id="reverse-charge-note" class="alert" hidden>{h(REVERSE_CHARGE_NOTICE)} Für diesen Kunden
+      wird daher keine Umsatzsteuer berechnet, unabhängig vom je Position gewählten USt-Satz.</div>
       <div class="position-section">
         <div class="split-head"><div><h3>Positionen</h3>
         <p class="muted">Positionen können hinzugefügt, entfernt und vor dem
@@ -1246,6 +1283,13 @@ def document_form(
       const template = document.getElementById("position-template");
       const add = document.getElementById("add-position");
       const taxEnabled = {"true" if tax_enabled else "false"};
+      const reverseChargeByCustomer = {reverse_charge_by_customer};
+      const customerSelect = document.getElementById("document-customer");
+      const reverseChargeNote = document.getElementById("reverse-charge-note");
+      const isReverseCharge = () => Boolean(reverseChargeByCustomer[customerSelect.value]);
+      const updateReverseChargeNote = () => {{
+        reverseChargeNote.hidden = !isReverseCharge();
+      }};
       const parseMoney = value => {{
         let normalized = String(value || "").trim().replace(/\\s/g, "");
         if (normalized.includes(",")) normalized = normalized.replace(/\\./g, "").replace(",", ".");
@@ -1254,6 +1298,8 @@ def document_form(
       const parseQuantity = value => Number.parseFloat(String(value || "").replace(",", ".")) || 0;
       const moneyText = value => value.toLocaleString("de-DE", {{minimumFractionDigits: 2, maximumFractionDigits: 2}}) + " €";
       const update = () => {{
+        updateReverseChargeNote();
+        const reverseCharge = isReverseCharge();
         let netSum = 0;
         let taxSum = 0;
         const cards = [...list.querySelectorAll(".position-card")];
@@ -1264,7 +1310,7 @@ def document_form(
           card.querySelector(".position-subtotal").textContent = moneyText(netSubtotal);
           card.querySelector(".remove-position").disabled = cards.length === 1;
           netSum += netSubtotal;
-          if (taxEnabled) {{
+          if (taxEnabled && !reverseCharge) {{
             const rateField = card.querySelector("[name=item_tax_rate]");
             const rate = rateField ? parseMoney(rateField.value) : 0;
             taxSum += netSubtotal * rate / 100;
@@ -1287,6 +1333,7 @@ def document_form(
         }});
       }};
       [...list.querySelectorAll(".position-card")].forEach(wire);
+      customerSelect.addEventListener("change", update);
       add.addEventListener("click", () => {{
         const fragment = template.content.cloneNode(true);
         const card = fragment.querySelector(".position-card");
@@ -1414,12 +1461,12 @@ def document_detail(connection, document_id: int) -> str:
             f'<button class="button danger">Stornieren</button></form>'
         )
     settings = DB.settings()
-    tax_notice = (
-        f'<p class="notice">{h(settings.get("small_business_notice"))}</p>'
-        if settings.get("small_business_enabled", "1") == "1"
-        and settings.get("small_business_notice")
-        else ""
-    )
+    if document.get("reverse_charge"):
+        tax_notice = f'<p class="notice">{h(REVERSE_CHARGE_NOTICE)}</p>'
+    elif settings.get("small_business_enabled", "1") == "1" and settings.get("small_business_notice"):
+        tax_notice = f'<p class="notice">{h(settings.get("small_business_notice"))}</p>'
+    else:
+        tax_notice = ""
     electronic_notice = ""
     if electronic:
         state = "success" if electronic["xsd_valid"] else "error"
@@ -2517,6 +2564,49 @@ def euer_page(connection, year: int) -> str:
     Entnahmen und steuerlich beschränkte Ausgaben sind gesondert zu prüfen.</div>"""
 
 
+def vat_liability_page(connection, year: int, period: str) -> str:
+    entries = euer_entries(connection, year)
+    periods = vat_liability_by_period(entries, period)
+    years = range(date.today().year, date.today().year - 8, -1)
+    year_options = "".join(
+        f'<option value="{value}" {"selected" if value == year else ""}>{value}</option>'
+        for value in years
+    )
+    period_options = "".join(
+        f'<option value="{value}" {"selected" if value == period else ""}>{label}</option>'
+        for value, label in (("month", "Monatlich"), ("quarter", "Vierteljährlich"))
+    )
+    period_rows = "".join(
+        f"""<tr><td>{h(p['period_label'])}</td>
+        <td class="money">{money(p['tax_collected_cents'])}</td>
+        <td class="money">{money(p['vorsteuer_paid_cents'])}</td>
+        <td class="money"><strong>{money(p['balance_cents'])}</strong></td>
+        <td>{german_date(p['due_date'])}</td></tr>"""
+        for p in periods
+    ) or '<tr><td colspan="5" class="empty">Für dieses Jahr wurden noch keine Zahlungen mit Umsatzsteuer erfasst.</td></tr>'
+    total_balance = sum(p["balance_cents"] for p in periods)
+    return f"""
+    <form class="filter-bar" method="get" action="/reports/zahllast">
+      <label><span>Auswertungsjahr</span><select name="year">{year_options}</select></label>
+      <label><span>Zeitraum</span><select name="period">{period_options}</select></label>
+      <button class="button">Anzeigen</button>
+    </form>
+    <div class="stats">
+      <article><span>Zahllast/Erstattung {year} gesamt</span><strong>{money(total_balance)}</strong></article>
+    </div>
+    <div class="card"><div class="card-head"><h2>Voraussichtliche Zahllast je Voranmeldezeitraum</h2>
+      <p class="muted">Vereinnahmte USt abzüglich gezahlter Vorsteuer, auf Zahlungsdatenbasis wie in
+      der EÜR. Ein positiver Betrag ist voraussichtlich ans Finanzamt abzuführen, ein negativer
+      Betrag eine mögliche Erstattung. Meldefrist jeweils der 10. des Folgemonats.</p></div>
+      <div class="table-wrap"><table><thead><tr><th>Zeitraum</th><th>Vereinnahmte USt</th>
+      <th>Gezahlte Vorsteuer</th><th>Zahllast</th><th>Meldefrist</th></tr></thead>
+      <tbody>{period_rows}</tbody></table></div>
+    </div>
+    <div class="alert">Nur eine Vorschau auf Zahlungsdatenbasis – ersetzt keine
+    Umsatzsteuervoranmeldung und keine Prüfung nach dem Soll-/Ist-Versteuerungsprinzip.
+    Rechtsverbindlich ist ausschließlich die ELSTER-Meldung.</div>"""
+
+
 def settings_tabs(active: str) -> str:
     tabs = [
         ("/settings", "unternehmen", "Unternehmen"),
@@ -2989,12 +3079,14 @@ def application(environ, start_response):
                 now = Database.now()
                 cursor = connection.execute(
                     """
-                    INSERT INTO customers(customer_number, company, contact_name, street, postal_code, city, email, buyer_reference, notes, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO customers(customer_number, company, contact_name, street, postal_code,
+                    city, country, email, buyer_reference, vat_id, notes, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (str(number), form["company"], form.get("contact_name", ""), form["street"],
-                     form["postal_code"], form["city"], form.get("email", ""),
-                     form.get("buyer_reference", ""), form.get("notes", ""), now, now),
+                     form["postal_code"], form["city"], form.get("country", "Deutschland").strip(),
+                     form.get("email", ""), form.get("buyer_reference", ""),
+                     form.get("vat_id", "").strip(), form.get("notes", ""), now, now),
                 )
                 connection.execute("UPDATE settings SET value=? WHERE key='customer_counter'", (str(number),))
                 Database.audit(connection, "customer", cursor.lastrowid, "created", str(number))
@@ -3021,13 +3113,14 @@ def application(environ, start_response):
                 connection.execute(
                     """
                     UPDATE customers SET company=?, contact_name=?, street=?, postal_code=?, city=?,
-                    country=?, email=?, buyer_reference=?, notes=?, updated_at=? WHERE id=?
+                    country=?, email=?, buyer_reference=?, vat_id=?, notes=?, updated_at=? WHERE id=?
                     """,
                     (
                         form["company"].strip(), form.get("contact_name", "").strip(),
                         form["street"].strip(), form["postal_code"].strip(), form["city"].strip(),
                         form.get("country", "Deutschland").strip(), form.get("email", "").strip(),
-                        form.get("buyer_reference", "").strip(), form.get("notes", "").strip(),
+                        form.get("buyer_reference", "").strip(), form.get("vat_id", "").strip(),
+                        form.get("notes", "").strip(),
                         now, customer_id,
                     ),
                 )
@@ -3186,19 +3279,24 @@ def application(environ, start_response):
                 terms = int(settings["payment_terms_days"])
                 due_date = (date.fromisoformat(issue_date) + timedelta(days=terms)).isoformat() if doc_type == "invoice" else None
                 items = document_items_from_form(form)
-                _, tax_total, total = document_totals(items, settings)
+                customer_id = int(form["customer_id"])
+                customer = connection.execute(
+                    "SELECT country, vat_id FROM customers WHERE id=?", (customer_id,)
+                ).fetchone()
+                reverse_charge = customer_reverse_charge_applies(dict(customer), settings)
+                _, tax_total, total = document_totals(items, settings, reverse_charge)
                 now = Database.now()
                 cursor = connection.execute(
                     """
                     INSERT INTO documents(document_type, status, customer_id, issue_date, service_start, service_end,
                     due_date, payment_terms_days, title, notes, source_document_id, credit_reason,
-                    total_cents, tax_cents, created_at, updated_at)
-                    VALUES (?, 'draft', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    total_cents, tax_cents, reverse_charge, created_at, updated_at)
+                    VALUES (?, 'draft', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
-                    (doc_type, int(form["customer_id"]), issue_date, form.get("service_start") or None,
+                    (doc_type, customer_id, issue_date, form.get("service_start") or None,
                      form.get("service_end") or None, due_date, terms, form.get("title", ""),
                      form.get("notes", ""), int(form["source_document_id"]) if form.get("source_document_id") else None,
-                     form.get("credit_reason", ""), total, tax_total, now, now),
+                     form.get("credit_reason", ""), total, tax_total, int(reverse_charge), now, now),
                 )
                 document_id = cursor.lastrowid
                 replace_document_items(connection, document_id, items)
@@ -3229,20 +3327,26 @@ def application(environ, start_response):
                     date.fromisoformat(issue_date) + timedelta(days=terms)
                 ).isoformat() if document["document_type"] == "invoice" else None
                 items = document_items_from_form(form)
-                _, tax_total, total = document_totals(items, settings)
+                customer_id = int(form["customer_id"])
+                customer = connection.execute(
+                    "SELECT country, vat_id FROM customers WHERE id=?", (customer_id,)
+                ).fetchone()
+                reverse_charge = customer_reverse_charge_applies(dict(customer), settings)
+                _, tax_total, total = document_totals(items, settings, reverse_charge)
                 now = Database.now()
                 connection.execute(
                     """
                     UPDATE documents SET customer_id=?, issue_date=?, service_start=?,
                     service_end=?, due_date=?, payment_terms_days=?, title=?, notes=?,
-                    credit_reason=?, total_cents=?, tax_cents=?, updated_at=? WHERE id=?
+                    credit_reason=?, total_cents=?, tax_cents=?, reverse_charge=?, updated_at=? WHERE id=?
                     """,
                     (
-                        int(form["customer_id"]), issue_date,
+                        customer_id, issue_date,
                         form.get("service_start") or None,
                         form.get("service_end") or None, due_date, terms,
                         form.get("title", ""), form.get("notes", ""),
-                        form.get("credit_reason", ""), total, tax_total, now, document_id,
+                        form.get("credit_reason", ""), total, tax_total, int(reverse_charge),
+                        now, document_id,
                     ),
                 )
                 replace_document_items(connection, document_id, items)
@@ -3958,6 +4062,18 @@ def application(environ, start_response):
                 return response(
                     start_response, target.read_bytes(), content_type="application/pdf",
                     headers=[("Content-Disposition", f'inline; filename="EÜR-{year}.pdf"')],
+                )
+            elif method == "GET" and path == "/reports/zahllast":
+                try:
+                    year = int(query.get("year", [str(date.today().year)])[0])
+                except ValueError as exc:
+                    raise ValueError("Ungültiges Auswertungsjahr.") from exc
+                period = query.get("period", ["month"])[0]
+                if period not in ("month", "quarter"):
+                    raise ValueError("Ungültiger Zeitraum.")
+                body, title, active = (
+                    vat_liability_page(connection, year, period),
+                    f"USt-Zahllast-Vorschau {year}", "zahllast",
                 )
             elif method == "GET" and path == "/settings":
                 body, title, active = settings_page(DB.settings()), "Einstellungen", "settings"

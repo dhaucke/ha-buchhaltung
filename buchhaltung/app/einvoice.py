@@ -9,6 +9,10 @@ from pathlib import Path
 
 MUSTANG_CLI_JAR = os.environ.get("MUSTANG_CLI_JAR", "/opt/mustang/Mustang-CLI.jar")
 
+REVERSE_CHARGE_NOTICE = (
+    "Steuerschuldnerschaft des Leistungsempfängers (Reverse-Charge-Verfahren gemäß § 13b UStG)."
+)
+
 
 def decimal_text(cents: int) -> str:
     return f"{Decimal(cents) / 100:.2f}"
@@ -23,6 +27,24 @@ def country_code(value: str) -> str:
         "austria": "AT",
         "schweiz": "CH",
         "switzerland": "CH",
+        "niederlande": "NL",
+        "netherlands": "NL",
+        "belgien": "BE",
+        "belgium": "BE",
+        "frankreich": "FR",
+        "france": "FR",
+        "italien": "IT",
+        "italy": "IT",
+        "spanien": "ES",
+        "spain": "ES",
+        "polen": "PL",
+        "poland": "PL",
+        "tschechien": "CZ",
+        "czechia": "CZ",
+        "dänemark": "DK",
+        "denmark": "DK",
+        "luxemburg": "LU",
+        "luxembourg": "LU",
     }
     if normalized.lower() in aliases:
         return aliases[normalized.lower()]
@@ -76,8 +98,38 @@ def build_en16931_data(
             "Für ZUGFeRD fehlen Pflichtangaben: " + ", ".join(missing)
         )
     total = decimal_text(document["total_cents"])
-    tax_enabled = settings.get("small_business_enabled", "1") != "1"
-    if tax_enabled:
+    small_business = settings.get("small_business_enabled", "1") == "1"
+    reverse_charge = bool(document.get("reverse_charge")) and not small_business
+    tax_enabled = not small_business and not reverse_charge
+    if small_business:
+        notice = (
+            settings.get("small_business_notice")
+            or "Steuerbefreiung für Kleinunternehmer gemäß § 19 UStG."
+        )
+        net_total = document["total_cents"]
+        tax_total = 0
+        bg_23 = [{
+            "BT-116": total,
+            "BT-116-1": "EUR",
+            "BT-117": "0.00",
+            "BT-117-1": "EUR",
+            "BT-118": "E",
+            "BT-119": "0.00",
+            "BT-120": notice,
+        }]
+    elif reverse_charge:
+        net_total = document["total_cents"]
+        tax_total = 0
+        bg_23 = [{
+            "BT-116": total,
+            "BT-116-1": "EUR",
+            "BT-117": "0.00",
+            "BT-117-1": "EUR",
+            "BT-118": "AE",
+            "BT-119": "0.00",
+            "BT-120": REVERSE_CHARGE_NOTICE,
+        }]
+    else:
         rate_groups: dict[int, dict[str, int]] = {}
         for item in items:
             rate_bp = item.get("tax_rate_bp", 0)
@@ -102,22 +154,6 @@ def build_en16931_data(
             }
             for rate_bp, amounts in sorted(rate_groups.items())
         ]
-    else:
-        notice = (
-            settings.get("small_business_notice")
-            or "Steuerbefreiung für Kleinunternehmer gemäß § 19 UStG."
-        )
-        net_total = document["total_cents"]
-        tax_total = 0
-        bg_23 = [{
-            "BT-116": total,
-            "BT-116-1": "EUR",
-            "BT-117": "0.00",
-            "BT-117-1": "EUR",
-            "BT-118": "E",
-            "BT-119": "0.00",
-            "BT-120": notice,
-        }]
     data = {
         "BT-1": document["document_number"],
         "BT-2": _date(document["issue_date"]),
@@ -162,6 +198,8 @@ def build_en16931_data(
     }
     if settings.get("vat_id"):
         data["BT-31"] = settings["vat_id"]
+    if customer.get("vat_id"):
+        data["BT-48"] = customer["vat_id"]
     if document.get("due_date") and document["document_type"] == "invoice":
         data["BT-9"] = _date(document["due_date"])
     # Always set BT-72: if only BT-73/BT-74 (service period) are present,
@@ -191,6 +229,12 @@ def build_en16931_data(
         if item.get("service_period"):
             description += f" – Leistungszeitraum: {item['service_period']}"
         item_rate_bp = item.get("tax_rate_bp", 0) if tax_enabled else 0
+        if reverse_charge:
+            line_category = "AE"
+        elif tax_enabled:
+            line_category = "S" if item_rate_bp > 0 else "Z"
+        else:
+            line_category = "E"
         data["BG-25"].append({
             "BT-126": str(item["position"]),
             "BT-127": description,
@@ -198,7 +242,7 @@ def build_en16931_data(
             "BT-146": decimal_text(item["unit_price_cents"]),
             "BT-129": str(Decimal(item["quantity_milli"]) / 1000),
             "BT-130": unit_code(item.get("unit", "")),
-            "BT-151": ("S" if item_rate_bp > 0 else "Z") if tax_enabled else "E",
+            "BT-151": line_category,
             "BT-152": f"{Decimal(item_rate_bp) / 100:.2f}",
             "BT-131": decimal_text(item["total_cents"]),
         })

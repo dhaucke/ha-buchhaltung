@@ -26,6 +26,7 @@ CREATE TABLE IF NOT EXISTS customers (
     country TEXT NOT NULL DEFAULT 'Deutschland',
     email TEXT NOT NULL DEFAULT '',
     buyer_reference TEXT NOT NULL DEFAULT '',
+    vat_id TEXT NOT NULL DEFAULT '',
     notes TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
@@ -51,6 +52,7 @@ CREATE TABLE IF NOT EXISTS documents (
     settled_at TEXT,
     total_cents INTEGER NOT NULL DEFAULT 0,
     tax_cents INTEGER NOT NULL DEFAULT 0,
+    reverse_charge INTEGER NOT NULL DEFAULT 0,
     finalized_at TEXT,
     sent_at TEXT,
     paid_at TEXT,
@@ -357,12 +359,20 @@ class Database:
                 "settlement_type": "TEXT NOT NULL DEFAULT ''",
                 "settled_at": "TEXT",
                 "tax_cents": "INTEGER NOT NULL DEFAULT 0",
+                "reverse_charge": "INTEGER NOT NULL DEFAULT 0",
             }
             for column, definition in document_migrations.items():
                 if column not in document_columns:
                     connection.execute(
                         f"ALTER TABLE documents ADD COLUMN {column} {definition}"
                     )
+            customer_columns = {
+                row["name"] for row in connection.execute("PRAGMA table_info(customers)")
+            }
+            if "vat_id" not in customer_columns:
+                connection.execute(
+                    "ALTER TABLE customers ADD COLUMN vat_id TEXT NOT NULL DEFAULT ''"
+                )
             supplier_columns = {
                 row["name"] for row in connection.execute("PRAGMA table_info(suppliers)")
             }

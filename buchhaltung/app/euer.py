@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import io
 from collections import defaultdict
+from datetime import date
 from pathlib import Path
 
 from reportlab.lib import colors
@@ -40,7 +41,7 @@ def euer_entries(connection, year: int) -> list[dict]:
     for row in connection.execute(
         """
         SELECT d.id, d.document_number number, d.paid_at payment_timestamp,
-               d.total_cents amount_cents, c.company party
+               d.total_cents amount_cents, d.tax_cents, c.company party
         FROM documents d JOIN customers c ON c.id=d.customer_id
         WHERE d.document_type='invoice' AND d.status='paid'
           AND substr(d.paid_at,1,10) BETWEEN ? AND ?
@@ -57,12 +58,13 @@ def euer_entries(connection, year: int) -> list[dict]:
             "party": row["party"],
             "category": "Betriebseinnahmen",
             "amount_cents": row["amount_cents"],
+            "tax_cents": row["tax_cents"],
         })
 
     for row in connection.execute(
         """
         SELECT d.id, d.document_number number, d.paid_at payment_timestamp,
-               d.total_cents amount_cents, c.company party
+               d.total_cents amount_cents, d.tax_cents, c.company party
         FROM documents d JOIN customers c ON c.id=d.customer_id
         WHERE d.document_type='credit' AND d.status='refunded'
           AND substr(d.paid_at,1,10) BETWEEN ? AND ?
@@ -79,6 +81,7 @@ def euer_entries(connection, year: int) -> list[dict]:
             "party": row["party"],
             "category": "Einnahmenkorrektur",
             "amount_cents": -row["amount_cents"],
+            "tax_cents": -row["tax_cents"],
         })
 
     for row in connection.execute(
@@ -145,6 +148,51 @@ def euer_summary(entries: list[dict]) -> dict:
         "vorsteuer_cents": vorsteuer,
         "expense_categories": dict(sorted(categories.items())),
     }
+
+
+MONTH_NAMES_DE = {
+    1: "Januar", 2: "Februar", 3: "März", 4: "April", 5: "Mai", 6: "Juni",
+    7: "Juli", 8: "August", 9: "September", 10: "Oktober", 11: "November", 12: "Dezember",
+}
+
+
+def vat_liability_by_period(entries: list[dict], period: str = "month") -> list[dict]:
+    """Group cash-basis USt/Vorsteuer into an informational Zahllast preview per
+    Voranmeldezeitraum. This is not a UStVA submission – just an early-warning
+    estimate of what a period's balance is likely to look like, with the
+    statutory reporting deadline (10th of the following month) shown alongside."""
+    groups: dict[str, dict[str, int]] = {}
+    for item in entries:
+        year, month = int(item["date"][:4]), int(item["date"][5:7])
+        key = f"{year}-Q{(month - 1) // 3 + 1}" if period == "quarter" else f"{year}-{month:02d}"
+        group = groups.setdefault(key, {"tax_collected_cents": 0, "vorsteuer_paid_cents": 0})
+        if item["kind"] == "Einnahme":
+            group["tax_collected_cents"] += item.get("tax_cents", 0)
+        else:
+            group["vorsteuer_paid_cents"] += item.get("vorsteuer_cents", 0)
+
+    result = []
+    for key in sorted(groups):
+        group = groups[key]
+        if period == "quarter":
+            year_str, quarter_str = key.split("-Q")
+            year, quarter = int(year_str), int(quarter_str)
+            label = f"{quarter}. Quartal {year}"
+            end_month = quarter * 3
+        else:
+            year_str, month_str = key.split("-")
+            year, end_month = int(year_str), int(month_str)
+            label = f"{MONTH_NAMES_DE[end_month]} {year}"
+        due_year, due_month = (year, end_month + 1) if end_month < 12 else (year + 1, 1)
+        result.append({
+            "period_key": key,
+            "period_label": label,
+            "tax_collected_cents": group["tax_collected_cents"],
+            "vorsteuer_paid_cents": group["vorsteuer_paid_cents"],
+            "balance_cents": group["tax_collected_cents"] - group["vorsteuer_paid_cents"],
+            "due_date": date(due_year, due_month, 10).isoformat(),
+        })
+    return result
 
 
 def create_euer_csv(entries: list[dict]) -> bytes:

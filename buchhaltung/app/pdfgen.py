@@ -28,6 +28,10 @@ TYPE_LABELS = {
     "credit": "Gutschrift",
 }
 
+REVERSE_CHARGE_NOTICE = (
+    "Steuerschuldnerschaft des Leistungsempfängers (Reverse-Charge-Verfahren gemäß § 13b UStG)."
+)
+
 
 def money(cents: int) -> str:
     value = Decimal(cents) / 100
@@ -242,7 +246,10 @@ def create_document_pdf(
         story.append(Paragraph(document["introduction"], styles["Body"]))
         story.append(Spacer(1, 4 * mm))
 
-    tax_enabled = settings.get("small_business_enabled", "1") != "1"
+    tax_enabled = (
+        settings.get("small_business_enabled", "1") != "1"
+        and not document.get("reverse_charge")
+    )
     header_row = ["Pos.", "Leistung / Leistungszeitraum", "Menge", "Einzelpreis", "Gesamt"]
     if tax_enabled:
         header_row.insert(4, "USt.")
@@ -354,7 +361,8 @@ def create_document_pdf(
         )
         story.append(Spacer(1, 4 * mm))
         if (
-            settings.get("small_business_enabled", "1") == "1"
+            not document.get("reverse_charge")
+            and settings.get("small_business_enabled", "1") == "1"
             and settings.get("small_business_notice")
         ):
             story.append(
@@ -384,6 +392,12 @@ def create_document_pdf(
                     styles["Body"],
                 )
             )
+
+    if document.get("reverse_charge"):
+        story.extend([
+            Spacer(1, 4 * mm),
+            Paragraph(f"<b>Hinweis:</b> {h_xml(REVERSE_CHARGE_NOTICE)}", styles["Body"]),
+        ])
 
     if document.get("notes"):
         story.extend([Spacer(1, 4 * mm), Paragraph(document["notes"], styles["Small"])])
