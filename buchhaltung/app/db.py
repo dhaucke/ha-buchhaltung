@@ -262,6 +262,13 @@ DEFAULT_SETTINGS = {
     "graph_sender": "",
     "graph_certificate_path": "/data/graph-certificate.pem",
     "graph_private_key_path": "/data/graph-private-key.pem",
+    "mail_provider": "graph",
+    "smtp_host": "",
+    "smtp_port": "587",
+    "smtp_username": "",
+    "smtp_password": "",
+    "smtp_sender": "",
+    "smtp_encryption": "starttls",
     "document_email_body": (
         "Guten Tag,\n\nanbei erhalten Sie {typ} {nummer}.\n\n"
         "Mit freundlichen Grüßen\n{absender}"

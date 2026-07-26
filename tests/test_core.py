@@ -6,6 +6,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from unittest.mock import MagicMock, patch
 from datetime import date
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
@@ -23,6 +24,7 @@ from euer import (
 )
 from pdfgen import create_document_pdf
 from pdfimport import analyze_invoice_pdf
+from smtp_mail import SmtpClient, SmtpConfigurationError
 
 
 class CoreTests(unittest.TestCase):
@@ -1076,6 +1078,70 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(quarterly[0]["tax_collected_cents"], 5700)
         self.assertEqual(quarterly[0]["balance_cents"], 5510)
         self.assertEqual(quarterly[0]["due_date"], "2026-04-10")
+
+    def test_smtp_client_not_configured_without_host(self):
+        client = SmtpClient({"smtp_host": "", "smtp_port": "587", "email": "a@b.de"})
+        self.assertFalse(client.configured())
+        with self.assertRaises(SmtpConfigurationError):
+            client.test_authentication()
+
+    def test_smtp_client_send_mail_uses_starttls_and_login(self):
+        settings = {
+            "smtp_host": "smtp.example.invalid", "smtp_port": "587",
+            "smtp_username": "user@example.invalid", "smtp_password": "secret",
+            "smtp_sender": "user@example.invalid", "smtp_encryption": "starttls",
+        }
+        client = SmtpClient(settings)
+        with patch("smtp_mail.smtplib.SMTP") as smtp_cls:
+            server = MagicMock()
+            smtp_cls.return_value = server
+            client.send_mail(
+                "empfaenger@example.invalid", "Betreff", "<p>Text</p>", "rechnung.pdf", b"%PDF-1.4"
+            )
+        smtp_cls.assert_called_once_with("smtp.example.invalid", 587, timeout=20)
+        server.starttls.assert_called_once()
+        server.login.assert_called_once_with("user@example.invalid", "secret")
+        self.assertEqual(server.sendmail.call_count, 1)
+        envelope_sender, recipients, message_text = server.sendmail.call_args[0]
+        self.assertEqual(envelope_sender, "user@example.invalid")
+        self.assertEqual(recipients, ["empfaenger@example.invalid"])
+        self.assertIn("Betreff", message_text)
+        self.assertIn("rechnung.pdf", message_text)
+        server.quit.assert_called_once()
+
+    def test_smtp_client_send_mail_uses_ssl_when_configured(self):
+        settings = {
+            "smtp_host": "smtp.example.invalid", "smtp_port": "465",
+            "smtp_sender": "user@example.invalid", "smtp_encryption": "ssl",
+        }
+        client = SmtpClient(settings)
+        with patch("smtp_mail.smtplib.SMTP_SSL") as smtp_ssl_cls, \
+             patch("smtp_mail.smtplib.SMTP") as smtp_cls:
+            server = MagicMock()
+            smtp_ssl_cls.return_value = server
+            client.send_test_email("empfaenger@example.invalid")
+        smtp_ssl_cls.assert_called_once()
+        smtp_cls.assert_not_called()
+        server.login.assert_not_called()
+        server.sendmail.assert_called_once()
+
+    def test_smtp_client_wraps_connection_errors(self):
+        client = SmtpClient({
+            "smtp_host": "smtp.example.invalid", "smtp_port": "587",
+            "smtp_sender": "user@example.invalid",
+        })
+        with patch("smtp_mail.smtplib.SMTP", side_effect=OSError("connection refused")):
+            with self.assertRaises(RuntimeError):
+                client.test_authentication()
+
+    def test_mail_client_factory_selects_provider(self):
+        os.environ.setdefault("HD_DATA_DIR", tempfile.mkdtemp())
+        from graph import GraphClient
+        from web import mail_client
+
+        self.assertIsInstance(mail_client({"mail_provider": "smtp"}), SmtpClient)
+        self.assertIsInstance(mail_client({"mail_provider": "graph"}), GraphClient)
+        self.assertIsInstance(mail_client({}), GraphClient)
 
     def test_zugferd_generation_and_embedded_xml_validation(self):
         try:

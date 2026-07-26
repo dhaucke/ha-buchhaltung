@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.10.0
+
+- SMTP als zweite Versandart neben Microsoft Graph: neue Einstellungsseite
+  „SMTP“ (Server, Port, Verschlüsselung, Benutzername/Passwort,
+  Absenderadresse) mit Verbindungstest und Testmail-Versand – für alle
+  E-Mail-Postfächer ohne Microsoft-365-Tenant (z. B. bei IONOS, Strato
+  oder anderen Hosting-Anbietern), ganz ohne Azure-App-Registrierung
+  oder Zertifikat. Eine neue Einstellung „Aktive Versandart“ wählt
+  zwischen Graph und SMTP; bestehende Installationen laufen unverändert
+  über Graph weiter.
+
 ## 0.9.0
 
 - Reverse-Charge-Verfahren (§ 13b UStG) für ausländische EU-Firmenkunden:

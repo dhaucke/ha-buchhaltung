@@ -29,6 +29,7 @@ from PIL import Image as PillowImage, UnidentifiedImageError
 from db import DEFAULT_SETTINGS, Database, suggested_payment_date
 from einvoice import create_zugferd
 from graph import GraphClient
+from smtp_mail import SmtpClient
 from euer import (
     EXPENSE_CATEGORIES, create_euer_csv, create_euer_pdf, euer_entries, euer_summary,
     vat_liability_by_period,
@@ -1163,7 +1164,7 @@ def send_payment_reminder(connection, document_id: int, form: dict) -> None:
         raise ValueError("Betreff und Nachricht dürfen nicht leer sein.")
     body_html = "<p>" + h(message).replace("\n\n", "</p><p>").replace("\n", "<br>") + "</p>"
     pdf = preferred_document_pdf(connection, document_id)
-    status = GraphClient(DB.settings()).send_pdf(
+    status = mail_client(DB.settings()).send_pdf(
         document["customer_email"], subject, body_html, pdf.name, pdf.read_bytes()
     )
     now = Database.now()
@@ -1747,6 +1748,12 @@ def recurring_form(connection, customer_id: int, template=None) -> str:
     </form>"""
 
 
+def mail_client(settings: dict[str, str]):
+    if settings.get("mail_provider", "graph") == "smtp":
+        return SmtpClient(settings)
+    return GraphClient(settings)
+
+
 def build_document_email_text(document: dict, settings: dict[str, str]) -> tuple[str, str]:
     company_name = settings.get("company_name", "")
     closing_name = settings.get("owner_name") or company_name
@@ -1815,7 +1822,7 @@ def send_document_email(
     if subject is None or message is None:
         subject, message = build_document_email_text(document, settings)
     body_html = "<p>" + h(message).replace("\n\n", "</p><p>").replace("\n", "<br>") + "</p>"
-    status = GraphClient(settings).send_pdf(
+    status = mail_client(settings).send_pdf(
         document["customer_email"], subject, body_html, pdf.name, pdf.read_bytes()
     )
     now = Database.now()
@@ -2613,6 +2620,7 @@ def settings_tabs(active: str) -> str:
         ("/settings/rechnungswesen", "rechnungswesen", "Rechnungswesen"),
         ("/settings/nummernkreise", "nummernkreise", "Nummernkreise"),
         ("/settings/microsoft", "microsoft", "Microsoft"),
+        ("/settings/smtp", "smtp", "SMTP"),
         ("/settings/protokoll", "protokoll", "Protokoll"),
     ]
     links = "".join(
@@ -2802,6 +2810,23 @@ def certificate_expiry(cert_path: str) -> date | None:
         return None
 
 
+def mail_provider_selector(settings: dict[str, str], return_to: str) -> str:
+    provider = settings.get("mail_provider", "graph")
+    options = "".join(
+        f'<option value="{value}" {"selected" if value == provider else ""}>{label}</option>'
+        for value, label in (("graph", "Microsoft Graph"), ("smtp", "SMTP"))
+    )
+    return f"""
+    <form class="card form" method="post" action="/settings">
+      <input type="hidden" name="return_to" value="{h(return_to)}">
+      <div class="form-grid">
+      <label><span>Aktive Versandart für ausgehende E-Mails</span>
+      <select name="mail_provider">{options}</select></label>
+      </div>
+      <div class="form-actions"><button class="button primary">Speichern</button></div>
+    </form>"""
+
+
 def microsoft_setup_page(settings: dict[str, str]) -> str:
     client_id = settings.get("graph_client_id", "")
     object_id = settings.get("graph_service_principal_object_id", "")
@@ -2869,6 +2894,7 @@ Test-ServicePrincipalAuthorization -Identity "{object_id or '<DIENSTPRINZIPAL-OB
     )
     return f"""
     {settings_tabs("microsoft")}
+    {mail_provider_selector(settings, "/settings/microsoft")}
     <div class="card form">
       <h2>Entra und Exchange Application RBAC</h2>
       <p>Diese Variante beschränkt die Anwendung in Exchange auf genau das eingetragene
@@ -2939,6 +2965,59 @@ Test-ServicePrincipalAuthorization -Identity "{object_id or '<DIENSTPRINZIPAL-OB
       <button class="button">Testmail senden</button>
       </form>''' if graph_status else ''}
       {'<form method="post" action="/settings/microsoft/test"><button class="button primary">Zertifikatsanmeldung testen</button></form>' if graph_status else ''}
+      </div>
+    </div>"""
+
+
+def settings_smtp_page(settings: dict[str, str]) -> str:
+    smtp_status = SmtpClient(settings).configured()
+    status_text = "vollständig eingerichtet" if smtp_status else "noch nicht vollständig eingerichtet"
+    encryption_options = "".join(
+        f'<option value="{value}" {"selected" if value == settings.get("smtp_encryption", "starttls") else ""}>{label}</option>'
+        for value, label in (
+            ("starttls", "STARTTLS (empfohlen, meist Port 587)"),
+            ("ssl", "SSL/TLS (meist Port 465)"),
+            ("none", "Keine Verschlüsselung (nicht empfohlen, nur lokale Relays)"),
+        )
+    )
+    test_recipient = settings.get("smtp_sender") or settings.get("email", "")
+    return f"""
+    {settings_tabs("smtp")}
+    {mail_provider_selector(settings, "/settings/smtp")}
+    <div class="card form">
+      <p>Alternative zu Microsoft Graph für jedes Postfach, das klassisches SMTP anbietet
+      (z. B. bei IONOS, Strato oder anderen Hosting-/Mail-Anbietern) – ohne Azure-App-Registrierung
+      oder Zertifikat.</p>
+    </div>
+    <form class="card form" method="post" action="/settings">
+      <input type="hidden" name="return_to" value="/settings/smtp">
+      <div class="settings-status"><span class="status {'paid' if smtp_status else 'draft'}">
+      SMTP: {h(status_text)}</span></div>
+      <div class="form-grid">
+      <label><span>SMTP-Server *</span><input name="smtp_host" placeholder="smtp.beispiel.de"
+      value="{h(settings.get('smtp_host', ''))}"></label>
+      <label><span>Port *</span><input type="number" min="1" max="65535" name="smtp_port"
+      value="{h(settings.get('smtp_port', '587'))}"></label>
+      <label><span>Verschlüsselung</span><select name="smtp_encryption">{encryption_options}</select></label>
+      <label><span>Absenderadresse *</span><input type="email" name="smtp_sender"
+      value="{h(settings.get('smtp_sender') or settings.get('email', ''))}"></label>
+      <label><span>Benutzername</span><input name="smtp_username"
+      value="{h(settings.get('smtp_username', ''))}"></label>
+      <label><span>Passwort</span><input type="password" name="smtp_password"
+      value="{h(settings.get('smtp_password', ''))}"></label>
+      </div>
+      <p class="notice">Das Passwort wird unverschlüsselt in der lokalen Datenbank gespeichert –
+      wie auch alle anderen Geschäftsdaten. Ein eigenes, nur für diesen Versand angelegtes
+      Postfachpasswort/App-Passwort wird empfohlen.</p>
+      <div class="form-actions"><button class="button primary">Speichern</button></div>
+    </form>
+    <div class="card form">
+      <div class="form-actions">
+      {f'''<form class="payment-action wide" method="post" action="/settings/smtp/send-test-email">
+      <input type="email" required name="test_recipient" value="{h(test_recipient)}" placeholder="empfaenger@beispiel.de">
+      <button class="button">Testmail senden</button>
+      </form>''' if smtp_status else ''}
+      {'<form method="post" action="/settings/smtp/test"><button class="button primary">Verbindung testen</button></form>' if smtp_status else ''}
       </div>
     </div>"""
 
@@ -4117,6 +4196,26 @@ def application(environ, start_response):
                     "Microsoft-Einrichtung",
                     "settings",
                 )
+            elif method == "GET" and path == "/settings/smtp":
+                body, title, active = (
+                    settings_smtp_page(DB.settings()), "SMTP-Einrichtung", "settings",
+                )
+            elif method == "POST" and path == "/settings/smtp/test":
+                SmtpClient(DB.settings()).test_authentication()
+                return redirect(
+                    start_response, "/settings/smtp", "SMTP-Verbindung war erfolgreich.",
+                )
+            elif method == "POST" and path == "/settings/smtp/send-test-email":
+                form = parse_form(environ)
+                recipient = str(form.get("test_recipient", "")).strip()
+                if not recipient:
+                    raise ValueError("Bitte eine Empfängeradresse für die Testmail angeben.")
+                SmtpClient(DB.settings()).send_test_email(recipient)
+                Database.audit(connection, "settings", None, "smtp_test_email_sent", recipient)
+                return redirect(
+                    start_response, "/settings/smtp",
+                    f"Testmail wurde an {recipient} gesendet.",
+                )
             elif method == "POST" and path == "/settings/microsoft/test":
                 GraphClient(DB.settings()).test_authentication()
                 return redirect(
@@ -4194,11 +4293,18 @@ def application(environ, start_response):
                     values["default_tax_rate_bp"] = str(
                         tax_rate_bp_from_percent(values["default_tax_rate_bp"])
                     )
+                if "smtp_port" in values:
+                    try:
+                        smtp_port = int(values["smtp_port"])
+                    except ValueError as exc:
+                        raise ValueError("Der SMTP-Port muss eine ganze Zahl sein.") from exc
+                    if not 1 <= smtp_port <= 65535:
+                        raise ValueError("Der SMTP-Port muss zwischen 1 und 65535 liegen.")
                 DB.update_settings(values)
                 return_to = form.get("return_to")
                 if return_to not in (
                     "/settings", "/settings/rechnungswesen",
-                    "/settings/nummernkreise", "/settings/microsoft",
+                    "/settings/nummernkreise", "/settings/microsoft", "/settings/smtp",
                 ):
                     return_to = "/settings"
                 return redirect(start_response, return_to, "Einstellungen wurden gespeichert.")
