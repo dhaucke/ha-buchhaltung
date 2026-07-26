@@ -629,6 +629,51 @@ def outstanding_cents(connection, document_id: int) -> int:
     return int(row[0] or 0) if row else 0
 
 
+KLEINUNTERNEHMER_PRIOR_YEAR_LIMIT_CENTS = 2_500_000
+KLEINUNTERNEHMER_CURRENT_YEAR_LIMIT_CENTS = 10_000_000
+
+
+def kleinunternehmer_threshold_warning(connection, settings: dict[str, str], today: date) -> str:
+    """Warn on the dashboard when revenue approaches or exceeds the §19 UStG thresholds.
+
+    Only relevant while Kleinunternehmer mode is active – once Regelbesteuerung is
+    switched on, VAT is already being charged and no warning is needed."""
+    if settings.get("small_business_enabled", "1") != "1":
+        return ""
+    current_year_income = euer_summary(euer_entries(connection, today.year))["income_cents"]
+    prior_year_income = euer_summary(euer_entries(connection, today.year - 1))["income_cents"]
+    if prior_year_income > KLEINUNTERNEHMER_PRIOR_YEAR_LIMIT_CENTS:
+        return (
+            f'<div class="alert error">Der Vorjahresumsatz ({money(prior_year_income)}) überschreitet die '
+            f'Kleinunternehmergrenze von {money(KLEINUNTERNEHMER_PRIOR_YEAR_LIMIT_CENTS)}. Die '
+            "Kleinunternehmerregelung darf für dieses Jahr nicht mehr angewendet werden – bitte den "
+            'Wechsel zur Regelbesteuerung prüfen (Einstellungen → Rechnungswesen).</div>'
+        )
+    if current_year_income > KLEINUNTERNEHMER_CURRENT_YEAR_LIMIT_CENTS:
+        return (
+            f'<div class="alert error">Der Umsatz in diesem Jahr ({money(current_year_income)}) hat die Grenze von '
+            f'{money(KLEINUNTERNEHMER_CURRENT_YEAR_LIMIT_CENTS)} überschritten. Die Kleinunternehmerregelung '
+            "entfällt damit ab sofort – bereits die nächste Rechnung muss mit Umsatzsteuer ausgestellt "
+            'werden (Einstellungen → Rechnungswesen).</div>'
+        )
+    if current_year_income >= KLEINUNTERNEHMER_CURRENT_YEAR_LIMIT_CENTS * 0.8:
+        return (
+            f'<div class="alert">Der Umsatz in diesem Jahr beträgt bereits {money(current_year_income)} und '
+            f'nähert sich der Kleinunternehmergrenze von {money(KLEINUNTERNEHMER_CURRENT_YEAR_LIMIT_CENTS)}.</div>'
+        )
+    return ""
+
+
+def current_year_vat_stats(connection, year: int) -> dict[str, int]:
+    tax_collected = connection.execute(
+        "SELECT COALESCE(sum(tax_cents),0) FROM documents "
+        "WHERE document_type='invoice' AND status='paid' AND substr(paid_at,1,4)=?",
+        (str(year),),
+    ).fetchone()[0]
+    vorsteuer_paid = euer_summary(euer_entries(connection, year))["vorsteuer_cents"]
+    return {"tax_collected_cents": tax_collected, "vorsteuer_paid_cents": vorsteuer_paid}
+
+
 def dashboard(connection) -> str:
     stats = {
         "customers": connection.execute("SELECT count(*) FROM customers").fetchone()[0],
@@ -701,14 +746,26 @@ def dashboard(connection) -> str:
         <p class="muted">Seit mehr als {draft_threshold_days} Tagen unverändert im Entwurfsstatus.</p></div>
         <div class="table-wrap"><table><thead><tr><th>Art</th><th>Kunde</th><th>Betreff</th>
         <th>Angelegt am</th><th></th></tr></thead><tbody>{stale_rows}</tbody></table></div></div>"""
+    settings = DB.settings()
+    threshold_warning = kleinunternehmer_threshold_warning(connection, settings, date.today())
+    vat_stats_card = ""
+    if settings.get("small_business_enabled", "1") != "1":
+        vat_stats = current_year_vat_stats(connection, date.today().year)
+        vat_stats_card = f"""
+      <article><span>Vereinnahmte USt {date.today().year}</span>
+      <strong>{money(vat_stats['tax_collected_cents'])}</strong></article>
+      <article><span>Gezahlte Vorsteuer {date.today().year}</span>
+      <strong>{money(vat_stats['vorsteuer_paid_cents'])}</strong></article>"""
     return f"""
     <div class="actions"><a class="button primary" href="/document/new?type=invoice">Neue Rechnung</a>
     <a class="button" href="/document/new?type=offer">Neues Angebot</a></div>
+    {threshold_warning}
     <div class="stats">
       <article><span>Kunden</span><strong>{stats['customers']}</strong></article>
       <article><span>Offene Rechnungen</span><strong>{stats['open']}</strong></article>
       <article><span>Offener Betrag</span><strong>{money(stats['outstanding'])}</strong></article>
       <article><span>Bezahlt {date.today().year}</span><strong>{money(stats['paid'])}</strong></article>
+      {vat_stats_card}
     </div>
     {stale_drafts_card}
     <div class="card"><div class="card-head"><h2>Letzte Dokumente</h2></div>
@@ -1606,6 +1663,18 @@ def recurring_form(connection, customer_id: int, template=None) -> str:
             ("pdf", "Immer normales PDF"),
         )
     )
+    settings = DB.settings()
+    tax_field = ""
+    if settings.get("small_business_enabled", "1") != "1":
+        tax_rate_bp = (
+            template["tax_rate_bp"] if editing
+            else int(settings.get("default_tax_rate_bp", "1900"))
+        )
+        tax_options = "".join(
+            f'<option value="{rate}" {"selected" if rate * 100 == tax_rate_bp else ""}>{rate} %</option>'
+            for rate in (19, 7, 0)
+        )
+        tax_field = f'<label><span>USt-Satz</span><select name="tax_rate">{tax_options}</select></label>'
     return f"""
     {warning}
     <form class="card form" method="post" action="{action}">
@@ -1620,6 +1689,7 @@ def recurring_form(connection, customer_id: int, template=None) -> str:
         <label><span>Menge</span><input name="quantity" value="{h(quantity)}"></label>
         <label><span>Einheit</span><input name="unit" value="{h(unit)}"></label>
         <label><span>Einzelpreis in EUR *</span><input required name="unit_price" inputmode="decimal" value="{h(unit_price)}"></label>
+        {tax_field}
         <label class="check"><input type="checkbox" name="auto_finalize" {auto_finalize_checked}><span>Automatisch fertigstellen und PDF erzeugen</span></label>
         <label class="check"><input type="checkbox" name="auto_send" {auto_send_checked} {'disabled' if not customer['email'] else ''}>
         <span>PDF automatisch an die Rechnungs-E-Mail versenden</span></label>
@@ -1767,30 +1837,36 @@ def run_recurring_invoice(connection, recurring_id: int, run_date: date, manual:
         monat_nummer=f"{run_date.month:02d}",
         jahr=run_date.year,
     )
-    terms = int(DB.settings()["payment_terms_days"])
+    settings = DB.settings()
+    terms = int(settings["payment_terms_days"])
     due_date = (run_date + timedelta(days=terms)).isoformat()
     qty = template["quantity_milli"]
-    total = int((Decimal(qty) / 1000 * template["unit_price_cents"]).quantize(Decimal("1")))
+    net_total = int((Decimal(qty) / 1000 * template["unit_price_cents"]).quantize(Decimal("1")))
+    tax_rate_bp = template["tax_rate_bp"] if settings.get("small_business_enabled", "1") != "1" else 0
+    tax_total = int(
+        (Decimal(net_total) * tax_rate_bp / 10000).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+    )
+    total = net_total + tax_total
     document_id = connection.execute(
         """
         INSERT INTO documents(document_type, status, customer_id, issue_date, service_start,
-        service_end, due_date, payment_terms_days, title, total_cents, created_at, updated_at)
-        VALUES ('invoice', 'draft', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        service_end, due_date, payment_terms_days, title, total_cents, tax_cents, created_at, updated_at)
+        VALUES ('invoice', 'draft', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             template["customer_id"], run_date.isoformat(), service_start.isoformat(),
-            service_end.isoformat(), due_date, terms, template["title"], total, now, now,
+            service_end.isoformat(), due_date, terms, template["title"], total, tax_total, now, now,
         ),
     ).lastrowid
     connection.execute(
         """
         INSERT INTO document_items(document_id, position, category, description, quantity_milli,
-        unit, unit_price_cents, total_cents, service_period)
-        VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?)
+        unit, unit_price_cents, total_cents, tax_rate_bp, service_period)
+        VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             document_id, template["category"], template["description"], qty, template["unit"],
-            template["unit_price_cents"], total, period_text,
+            template["unit_price_cents"], net_total, tax_rate_bp, period_text,
         ),
     )
     status = "draft_created"
@@ -2116,13 +2192,14 @@ def update_archive_analysis(connection, archive_id: int, result: dict):
     connection.execute(
         """
         UPDATE archive_files SET extracted_text=?, detected_invoice_number=?,
-        detected_issue_date=?, detected_amount_cents=?, detected_customer_name=?,
-        detected_customer_number=?, detected_street=?, detected_postal_code=?, detected_city=?, analyzed_at=?,
-        analysis_error=? WHERE id=?
+        detected_issue_date=?, detected_amount_cents=?, detected_tax_rate_bp=?,
+        detected_customer_name=?, detected_customer_number=?, detected_street=?,
+        detected_postal_code=?, detected_city=?, analyzed_at=?, analysis_error=? WHERE id=?
         """,
         (
             result["text"], result["invoice_number"], result["issue_date"],
-            result["amount_cents"], result["customer_name"], result["customer_number"],
+            result["amount_cents"], result.get("tax_rate_bp"),
+            result["customer_name"], result["customer_number"],
             result["street"], result["postal_code"],
             result["city"], Database.now(), result["error"],
             archive_id,
@@ -2969,13 +3046,17 @@ def application(environ, start_response):
                 send_format = str(form.get("send_format", "auto")).strip()
                 if send_format not in ("auto", "pdf", "zugferd"):
                     raise ValueError("Ungültiges Versandformat.")
+                tax_rate_bp = (
+                    tax_rate_bp_from_percent(str(form.get("tax_rate", "0")))
+                    if DB.settings().get("small_business_enabled", "1") != "1" else 0
+                )
                 now = Database.now()
                 recurring_id = connection.execute(
                     """
                     INSERT INTO recurring_invoices(customer_id, active, title, category, description,
                     service_period_template, quantity_milli, unit, unit_price_cents, billing_day,
-                    auto_finalize, auto_send, send_format, created_at, updated_at)
-                    VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    auto_finalize, auto_send, send_format, tax_rate_bp, created_at, updated_at)
+                    VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         customer_id, form.get("title", "").strip(), form.get("category", "").strip(),
@@ -2983,7 +3064,7 @@ def application(environ, start_response):
                         quantity_milli(form.get("quantity", "1")), form.get("unit", "pauschal").strip(),
                         cents(form["unit_price"]), int(form["billing_day"]),
                         1 if form.get("auto_finalize") == "on" or auto_send else 0, auto_send,
-                        send_format, now, now,
+                        send_format, tax_rate_bp, now, now,
                     ),
                 ).lastrowid
                 Database.audit(connection, "recurring_invoice", recurring_id, "created")
@@ -3015,12 +3096,16 @@ def application(environ, start_response):
                 send_format = str(form.get("send_format", "auto")).strip()
                 if send_format not in ("auto", "pdf", "zugferd"):
                     raise ValueError("Ungültiges Versandformat.")
+                tax_rate_bp = (
+                    tax_rate_bp_from_percent(str(form.get("tax_rate", "0")))
+                    if DB.settings().get("small_business_enabled", "1") != "1" else 0
+                )
                 connection.execute(
                     """
                     UPDATE recurring_invoices SET title=?, category=?, description=?,
                     service_period_template=?, quantity_milli=?, unit=?, unit_price_cents=?,
-                    billing_day=?, auto_finalize=?, auto_send=?, send_format=?, updated_at=?
-                    WHERE id=?
+                    billing_day=?, auto_finalize=?, auto_send=?, send_format=?, tax_rate_bp=?,
+                    updated_at=? WHERE id=?
                     """,
                     (
                         form.get("title", "").strip(), form.get("category", "").strip(),
@@ -3028,7 +3113,7 @@ def application(environ, start_response):
                         quantity_milli(form.get("quantity", "1")), form.get("unit", "pauschal").strip(),
                         cents(form["unit_price"]), int(form["billing_day"]),
                         1 if form.get("auto_finalize") == "on" or auto_send else 0, auto_send,
-                        send_format, Database.now(), recurring_id,
+                        send_format, tax_rate_bp, Database.now(), recurring_id,
                     ),
                 )
                 Database.audit(connection, "recurring_invoice", recurring_id, "updated")
@@ -3682,19 +3767,30 @@ def application(environ, start_response):
                 if existing:
                     return redirect(start_response, f"/incoming/{existing['id']}")
                 now = Database.now()
+                gross_cents = item["detected_amount_cents"] or 0
+                # Ein erkannter USt-Satz ist für Kleinunternehmer irrelevant (der Vorsteuerabzug
+                # entfällt ohnehin), daher wird er nur bei aktiver Regelbesteuerung übernommen.
+                settings = DB.settings()
+                tax_rate_bp = (
+                    item["detected_tax_rate_bp"] or 0
+                    if settings.get("small_business_enabled", "1") != "1" else 0
+                )
+                deductible_cents, vorsteuer_cents, tax_rate_bp = incoming_deductible_split(
+                    gross_cents, 100, tax_rate_bp, settings
+                )
                 incoming_id = connection.execute(
                     """
                     INSERT INTO incoming_invoices(
                         archive_file_id, invoice_number, invoice_date, eur_category,
-                        gross_cents, deductible_cents, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        gross_cents, deductible_cents, tax_rate_bp, vorsteuer_cents,
+                        created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         archive_id, item["detected_invoice_number"],
                         item["detected_issue_date"] or date.today().isoformat(),
                         "Fremdleistungen",
-                        item["detected_amount_cents"] or 0,
-                        item["detected_amount_cents"] or 0,
+                        gross_cents, deductible_cents, tax_rate_bp, vorsteuer_cents,
                         now, now,
                     ),
                 ).lastrowid

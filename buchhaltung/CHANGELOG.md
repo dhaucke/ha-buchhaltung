@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.8.1
+
+- Fehler behoben: automatisch erzeugte Dauerrechnungen haben bei aktiver
+  Regelbesteuerung keine Umsatzsteuer berechnet, da weder das
+  Dauerrechnungs-Formular noch die automatische Erzeugung einen
+  USt-Satz kannten – wer eine Dauerrechnung mit automatischem Versand
+  laufen hatte, hat Rechnungen ohne ausgewiesene USt verschickt
+- neue Warnung auf dem Dashboard, wenn der Umsatz sich den
+  Kleinunternehmergrenzen nach § 19 UStG nähert oder sie überschreitet
+  (Vorjahresumsatz über 25.000 € bzw. laufender Umsatz über 100.000 €)
+- beim Import von Eingangsrechnungen wird ein im Beleg genannter
+  USt-Satz jetzt automatisch erkannt und bei aktiver Regelbesteuerung
+  in den Entwurf übernommen; für Kleinunternehmer bleibt er weiterhin
+  ohne Bedeutung, da der Vorsteuerabzug ohnehin entfällt
+- neue Dashboard-Kacheln „Vereinnahmte USt“ und „Gezahlte Vorsteuer“ für
+  das laufende Jahr, sichtbar nur bei aktiver Regelbesteuerung
+
 ## 0.8.0
 
 - das Tool war bisher ausschließlich für Kleinunternehmer nach § 19 UStG

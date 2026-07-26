@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import os
 import sqlite3
 import sys
@@ -725,6 +726,203 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(summary["vorsteuer_cents"], 1900)
         csv_data = create_euer_csv(entries).decode("utf-8-sig")
         self.assertIn("Gezahlte Vorsteuer", csv_data)
+
+    def _recurring_invoice_with_tax_rate(self, connection, customer_id, tax_rate_bp):
+        now = Database.now()
+        return connection.execute(
+            """
+            INSERT INTO recurring_invoices(
+                customer_id, active, title, category, description, service_period_template,
+                quantity_milli, unit, unit_price_cents, billing_day, auto_finalize, auto_send,
+                send_format, tax_rate_bp, created_at, updated_at
+            ) VALUES (?, 1, 'Hosting', 'Hosting', 'Webserver', '{monat} {jahr}', 1000, 'pauschal',
+                      10000, 1, 0, 0, 'auto', ?, ?, ?)
+            """,
+            (customer_id, tax_rate_bp, now, now),
+        ).lastrowid
+
+    def test_run_recurring_invoice_charges_vat_in_regelbesteuerung(self):
+        os.environ.setdefault("HD_DATA_DIR", tempfile.mkdtemp())
+        import web as web_module
+        from web import run_recurring_invoice
+
+        self.db.update_settings({
+            "company_name": "Musterbetrieb", "owner_name": "Max Mustermann",
+            "street": "Beispielstraße 1", "postal_code": "10117", "city": "Berlin",
+            "email": "rechnung@example.invalid", "small_business_enabled": "0",
+        })
+        # run_recurring_invoice reads settings via web.py's module-level DB singleton,
+        # not the connection it's given – point it at this test's database.
+        original_db = web_module.DB
+        web_module.DB = self.db
+        self.addCleanup(setattr, web_module, "DB", original_db)
+        now = Database.now()
+        with self.db.connect() as connection:
+            customer_id = connection.execute(
+                """
+                INSERT INTO customers(customer_number, company, street, postal_code, city, email, created_at, updated_at)
+                VALUES ('1','Kunde GmbH','Weg 1','10115','Berlin','kunde@example.invalid',?,?)
+                """,
+                (now, now),
+            ).lastrowid
+            recurring_id = self._recurring_invoice_with_tax_rate(connection, customer_id, 1900)
+            document_id, status, error = run_recurring_invoice(
+                connection, recurring_id, date(2026, 7, 1), manual=True
+            )
+            document = connection.execute(
+                "SELECT * FROM documents WHERE id=?", (document_id,)
+            ).fetchone()
+            item = connection.execute(
+                "SELECT * FROM document_items WHERE document_id=?", (document_id,)
+            ).fetchone()
+        self.assertEqual(status, "draft_created", error)
+        self.assertEqual(document["total_cents"], 11900)
+        self.assertEqual(document["tax_cents"], 1900)
+        self.assertEqual(item["total_cents"], 10000)
+        self.assertEqual(item["tax_rate_bp"], 1900)
+
+    def test_run_recurring_invoice_forces_no_vat_in_kleinunternehmer_mode(self):
+        os.environ.setdefault("HD_DATA_DIR", tempfile.mkdtemp())
+        import web as web_module
+        from web import run_recurring_invoice
+
+        self.db.update_settings({
+            "company_name": "Musterbetrieb", "owner_name": "Max Mustermann",
+            "street": "Beispielstraße 1", "postal_code": "10117", "city": "Berlin",
+            "email": "rechnung@example.invalid", "small_business_enabled": "1",
+        })
+        original_db = web_module.DB
+        web_module.DB = self.db
+        self.addCleanup(setattr, web_module, "DB", original_db)
+        now = Database.now()
+        with self.db.connect() as connection:
+            customer_id = connection.execute(
+                """
+                INSERT INTO customers(customer_number, company, street, postal_code, city, email, created_at, updated_at)
+                VALUES ('1','Kunde GmbH','Weg 1','10115','Berlin','kunde@example.invalid',?,?)
+                """,
+                (now, now),
+            ).lastrowid
+            # tax_rate_bp is still set on the template (e.g. left over from a prior
+            # Regelbesteuerung period) – Kleinunternehmer mode must ignore it.
+            recurring_id = self._recurring_invoice_with_tax_rate(connection, customer_id, 1900)
+            document_id, status, error = run_recurring_invoice(
+                connection, recurring_id, date(2026, 7, 1), manual=True
+            )
+            document = connection.execute(
+                "SELECT * FROM documents WHERE id=?", (document_id,)
+            ).fetchone()
+            item = connection.execute(
+                "SELECT * FROM document_items WHERE document_id=?", (document_id,)
+            ).fetchone()
+        self.assertEqual(status, "draft_created", error)
+        self.assertEqual(document["total_cents"], 10000)
+        self.assertEqual(document["tax_cents"], 0)
+        self.assertEqual(item["tax_rate_bp"], 0)
+
+    def test_kleinunternehmer_threshold_warning_levels(self):
+        os.environ.setdefault("HD_DATA_DIR", tempfile.mkdtemp())
+        from web import kleinunternehmer_threshold_warning
+
+        now = Database.now()
+        with self.db.connect() as connection:
+            customer_id = connection.execute(
+                """
+                INSERT INTO customers(customer_number, company, street, postal_code, city, created_at, updated_at)
+                VALUES ('1','Kunde GmbH','Weg 1','10115','Berlin',?,?)
+                """,
+                (now, now),
+            ).lastrowid
+
+            def paid_invoice(number, total_cents, paid_at):
+                connection.execute(
+                    """
+                    INSERT INTO documents(document_type, document_number, status, customer_id,
+                    issue_date, total_cents, paid_at, created_at, updated_at)
+                    VALUES ('invoice', ?, 'paid', ?, ?, ?, ?, ?, ?)
+                    """,
+                    (number, customer_id, paid_at[:10], total_cents, paid_at, now, now),
+                )
+
+            settings = {"small_business_enabled": "1"}
+            self.assertEqual(
+                kleinunternehmer_threshold_warning(connection, settings, date(2026, 7, 1)), ""
+            )
+
+            paid_invoice("2026-1", 8_500_000, "2026-01-10T10:00:00")
+            warning = kleinunternehmer_threshold_warning(connection, settings, date(2026, 7, 1))
+            self.assertIn("nähert sich", warning)
+
+            paid_invoice("2026-2", 2_000_000, "2026-02-10T10:00:00")
+            warning = kleinunternehmer_threshold_warning(connection, settings, date(2026, 7, 1))
+            self.assertIn("entfällt damit ab sofort", warning)
+
+            paid_invoice("2025-1", 3_000_000, "2025-06-10T10:00:00")
+            warning = kleinunternehmer_threshold_warning(connection, settings, date(2026, 7, 1))
+            self.assertIn("Vorjahresumsatz", warning)
+
+            settings["small_business_enabled"] = "0"
+            self.assertEqual(
+                kleinunternehmer_threshold_warning(connection, settings, date(2026, 7, 1)), ""
+            )
+
+    def test_current_year_vat_stats_computes_correctly(self):
+        os.environ.setdefault("HD_DATA_DIR", tempfile.mkdtemp())
+        from web import current_year_vat_stats
+
+        now = Database.now()
+        with self.db.connect() as connection:
+            customer_id = connection.execute(
+                """
+                INSERT INTO customers(customer_number, company, street, postal_code, city, created_at, updated_at)
+                VALUES ('1','Kunde GmbH','Weg 1','10115','Berlin',?,?)
+                """,
+                (now, now),
+            ).lastrowid
+            connection.execute(
+                """
+                INSERT INTO documents(document_type, document_number, status, customer_id,
+                issue_date, total_cents, tax_cents, paid_at, created_at, updated_at)
+                VALUES ('invoice','2026-1','paid',?,'2026-01-05',11900,1900,'2026-01-10T10:00:00',?,?)
+                """,
+                (customer_id, now, now),
+            )
+            supplier_id = connection.execute(
+                "INSERT INTO suppliers(company,created_at,updated_at) VALUES ('Lieferant',?,?)",
+                (now, now),
+            ).lastrowid
+            connection.execute(
+                """
+                INSERT INTO incoming_invoices(
+                    supplier_id, invoice_number, invoice_date, payment_date, status,
+                    eur_category, gross_cents, business_share_percent, deductible_cents,
+                    tax_rate_bp, vorsteuer_cents, created_at, updated_at
+                ) VALUES (?, 'R-1', '2026-01-01', '2026-01-05', 'paid',
+                          'Software und IT', 5950, 100, 5000, 1900, 950, ?, ?)
+                """,
+                (supplier_id, now, now),
+            )
+            stats = current_year_vat_stats(connection, 2026)
+        self.assertEqual(stats["tax_collected_cents"], 1900)
+        self.assertEqual(stats["vorsteuer_paid_cents"], 950)
+
+    def test_analyze_invoice_pdf_detects_tax_rate_for_incoming_only(self):
+        from reportlab.pdfgen import canvas as pdf_canvas
+
+        buffer = io.BytesIO()
+        canvas_obj = pdf_canvas.Canvas(buffer)
+        canvas_obj.drawString(50, 750, "Lieferant GmbH, Beispielweg 1, 12345 Musterstadt")
+        canvas_obj.drawString(50, 700, "Rechnungsnummer: RE-2026-001")
+        canvas_obj.drawString(50, 600, "zzgl. 19% USt: 19,00 EUR")
+        canvas_obj.drawString(50, 560, "Rechnungsbetrag: 119,00 EUR")
+        canvas_obj.save()
+        raw = buffer.getvalue()
+
+        incoming_result = analyze_invoice_pdf(raw, "beleg.pdf", {}, "incoming")
+        outgoing_result = analyze_invoice_pdf(raw, "beleg.pdf", {}, "outgoing")
+
+        self.assertEqual(incoming_result["tax_rate_bp"], 1900)
+        self.assertIsNone(outgoing_result["tax_rate_bp"])
 
     def test_zugferd_generation_and_embedded_xml_validation(self):
         try:

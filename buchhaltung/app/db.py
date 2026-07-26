@@ -87,6 +87,7 @@ CREATE TABLE IF NOT EXISTS archive_files (
     detected_invoice_number TEXT NOT NULL DEFAULT '',
     detected_issue_date TEXT NOT NULL DEFAULT '',
     detected_amount_cents INTEGER,
+    detected_tax_rate_bp INTEGER,
     detected_customer_name TEXT NOT NULL DEFAULT '',
     detected_customer_number TEXT NOT NULL DEFAULT '',
     detected_street TEXT NOT NULL DEFAULT '',
@@ -154,6 +155,7 @@ CREATE TABLE IF NOT EXISTS recurring_invoices (
     auto_finalize INTEGER NOT NULL DEFAULT 1,
     auto_send INTEGER NOT NULL DEFAULT 0,
     send_format TEXT NOT NULL DEFAULT 'auto' CHECK(send_format IN ('auto','pdf','zugferd')),
+    tax_rate_bp INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -315,6 +317,7 @@ class Database:
                 "detected_invoice_number": "TEXT NOT NULL DEFAULT ''",
                 "detected_issue_date": "TEXT NOT NULL DEFAULT ''",
                 "detected_amount_cents": "INTEGER",
+                "detected_tax_rate_bp": "INTEGER",
                 "detected_customer_name": "TEXT NOT NULL DEFAULT ''",
                 "detected_customer_number": "TEXT NOT NULL DEFAULT ''",
                 "detected_street": "TEXT NOT NULL DEFAULT ''",
@@ -374,6 +377,11 @@ class Database:
                 connection.execute(
                     "ALTER TABLE recurring_invoices ADD COLUMN send_format "
                     "TEXT NOT NULL DEFAULT 'auto'"
+                )
+            if "tax_rate_bp" not in recurring_columns:
+                connection.execute(
+                    "ALTER TABLE recurring_invoices ADD COLUMN tax_rate_bp "
+                    "INTEGER NOT NULL DEFAULT 0"
                 )
             item_columns = {
                 row["name"] for row in connection.execute("PRAGMA table_info(document_items)")

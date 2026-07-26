@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import re
 from datetime import datetime
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 import pdfplumber
@@ -32,6 +33,11 @@ CUSTOMER_NUMBER_PATTERN = re.compile(
     re.IGNORECASE,
 )
 POSTAL_PATTERN = re.compile(r"^(\d{5})\s+(.+)$")
+TAX_RATE_PATTERN = re.compile(
+    r"(?:(\d{1,2}(?:,\d{1,2})?)\s*%\s*(?:USt|MwSt|Umsatzsteuer|Mehrwertsteuer)"
+    r"|(?:USt|MwSt|Umsatzsteuer|Mehrwertsteuer)\.?\s*:?\s*(\d{1,2}(?:,\d{1,2})?)\s*%)",
+    re.IGNORECASE,
+)
 
 
 def _iso_date(value: str) -> str:
@@ -43,6 +49,13 @@ def _iso_date(value: str) -> str:
 
 def _money_cents(value: str) -> int:
     return int(round(float(value.replace(".", "").replace(",", ".")) * 100))
+
+
+def _tax_rate_bp(value: str) -> int | None:
+    try:
+        return int((Decimal(value.replace(",", ".")) * 100).to_integral_value())
+    except InvalidOperation:
+        return None
 
 
 def _group_left_words(page) -> list[list[str]]:
@@ -172,6 +185,7 @@ def analyze_invoice_pdf(
         "invoice_number": "",
         "issue_date": "",
         "amount_cents": None,
+        "tax_rate_bp": None,
         "customer_name": "",
         "customer_number": "",
         "street": "",
@@ -208,6 +222,11 @@ def analyze_invoice_pdf(
             amount = AMOUNT_PATTERN.search(normalized_text)
             if amount:
                 result["amount_cents"] = _money_cents(amount.group(1))
+
+            if direction == "incoming":
+                tax_rate = TAX_RATE_PATTERN.search(normalized_text)
+                if tax_rate:
+                    result["tax_rate_bp"] = _tax_rate_bp(tax_rate.group(1) or tax_rate.group(2))
 
             if document.pages:
                 page = document.pages[0]
